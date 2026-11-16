@@ -60,6 +60,11 @@ export function makePersonalHandlers(deps: PersonalDeps) {
         })),
       };
     }),
+    hevy_update_routine: guard("Hevy", async (a) => {
+      const res = await deps.hevy!.updateRoutine(a.routine_id, { title: a.title, notes: a.notes, exercises: a.exercises });
+      const r = Array.isArray(res?.routine) ? res.routine[0] : res?.routine ?? res;
+      return { updated: true, id: r?.id ?? a.routine_id, title: r?.title, exercises: (r?.exercises ?? []).length };
+    }),
     hevy_search_exercises: guard("Hevy", async (a) => ({ matches: (await deps.hevy!.searchExerciseTemplates(a.query)).slice(0, 25) })),
     hevy_get_exercise_history: guard("Hevy", async (a) =>
       deps.hevy!.getExerciseHistory(a.exercise_template_id, { start_date: a.start_date, end_date: a.end_date })),
@@ -91,6 +96,24 @@ export function registerPersonalTools(server: McpServer, deps: PersonalDeps, use
   reg("hevy_get_workout", "One Hevy workout by id, with all exercises and sets.", { workout_id: z.string() });
   reg("hevy_get_workout_count", "Total number of workouts logged in Hevy.", {});
   reg("hevy_get_routines", "The user's saved Hevy routines (exercises, target sets, rep ranges).", {});
+  reg("hevy_update_routine",
+    "Update a saved Hevy routine. Only the listed exercises change (matched by exercise_template_id): new notes, rest, and/or sets (type, weight_kg, reps, rep_range). Everything else is kept.",
+    {
+      routine_id: z.string(),
+      title: z.string().optional(),
+      notes: z.string().optional(),
+      exercises: z.array(z.object({
+        exercise_template_id: z.string(),
+        notes: z.string().optional(),
+        rest_seconds: z.number().int().min(0).optional(),
+        sets: z.array(z.object({
+          type: z.enum(["warmup", "normal", "failure", "dropset"]).optional(),
+          weight_kg: z.number().min(0).nullable().optional(),
+          reps: z.number().int().min(0).nullable().optional(),
+          rep_range: z.object({ start: z.number().int(), end: z.number().int() }).nullable().optional(),
+        })).optional(),
+      })).min(1),
+    });
   reg("hevy_search_exercises", "Find Hevy exercise templates by name (returns ids for hevy_get_exercise_history).", { query: z.string().min(2) });
   reg("hevy_get_exercise_history", "Every logged set of one exercise over time (weights, reps) - use for progress and heaviest-lift questions.",
     { exercise_template_id: z.string(), start_date: isoDate.optional(), end_date: isoDate.optional() });

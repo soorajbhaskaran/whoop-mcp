@@ -47,6 +47,61 @@ export class HevyClient {
     return out;
   }
 
+  /** Write call (PUT/POST) with a JSON body. */
+  private async send<T>(method: "PUT" | "POST", path: string, body: unknown): Promise<T> {
+    const res = await this.fetchImpl(API_BASE + path, {
+      method,
+      headers: { "api-key": this.apiKey, accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 401 || res.status === 403) throw new Error("Hevy rejected the API key — check HEVY_API_KEY (Hevy Pro required).");
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`Hevy API ${res.status} on ${method} ${path}: ${detail.slice(0, 300)}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  /**
+   * Patch a routine: exercises matched by exercise_template_id get the given notes / rest / sets;
+   * every other exercise and field is sent back unchanged (Hevy's PUT replaces the whole routine).
+   */
+  async updateRoutine(routineId: string, patch: {
+    title?: string;
+    notes?: string;
+    exercises: Array<{ exercise_template_id: string; notes?: string; rest_seconds?: number;
+      sets?: Array<{ type?: string; weight_kg?: number | null; reps?: number | null; rep_range?: { start: number; end: number } | null }> }>;
+  }) {
+    const routine = (await this.getRoutines()).find((r) => r.id === routineId);
+    if (!routine) throw new Error(`No Hevy routine with id ${routineId}`);
+    const byId = new Map(patch.exercises.map((e) => [e.exercise_template_id, e]));
+    const unknown = patch.exercises.filter((e) => !(routine.exercises ?? []).some((x: any) => x.exercise_template_id === e.exercise_template_id));
+    if (unknown.length) throw new Error(`Not in routine "${routine.title}": ${unknown.map((u) => u.exercise_template_id).join(", ")}`);
+    const cleanSet = (s: any) => ({
+      type: s.type ?? "normal",
+      weight_kg: s.weight_kg ?? null,
+      reps: s.reps ?? null,
+      distance_meters: s.distance_meters ?? null,
+      duration_seconds: s.duration_seconds ?? null,
+      ...(s.rep_range ? { rep_range: { start: s.rep_range.start, end: s.rep_range.end } } : {}),
+    });
+    const exercises = (routine.exercises ?? []).map((e: any) => {
+      const c = byId.get(e.exercise_template_id);
+      const sets = c?.sets
+        ? c.sets.map((s, i) => cleanSet({ ...(e.sets?.[i] ?? {}), ...s }))
+        : (e.sets ?? []).map(cleanSet);
+      return {
+        exercise_template_id: e.exercise_template_id,
+        superset_id: e.superset_id ?? null,
+        rest_seconds: c?.rest_seconds ?? e.rest_seconds ?? null,
+        notes: c?.notes ?? e.notes ?? null,
+        sets,
+      };
+    });
+    const body = { routine: { title: patch.title ?? routine.title, notes: patch.notes ?? routine.notes ?? null, exercises } };
+    return this.send<any>("PUT", `/v1/routines/${encodeURIComponent(routineId)}`, body);
+  }
+
   getWorkout(id: string) { return this.json<any>(`/v1/workouts/${encodeURIComponent(id)}`); }
   getWorkoutCount() { return this.json<{ workout_count: number }>("/v1/workouts/count"); }
 

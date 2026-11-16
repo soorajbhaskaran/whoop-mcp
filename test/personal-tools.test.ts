@@ -117,3 +117,27 @@ describe("config", () => {
     expect(c.stravaClientId).toBeUndefined();
   });
 });
+
+describe("HevyClient.updateRoutine", () => {
+  it("keeps untouched exercises and PUTs the merged routine", async () => {
+    const { HevyClient } = await import("../src/hevy/client");
+    const calls: any[] = [];
+    const routine = { id: "r1", title: "Push A", folder_id: 9, notes: null, exercises: [
+      { exercise_template_id: "A", rest_seconds: 120, notes: "old", superset_id: null, sets: [{ type: "normal", weight_kg: 60, reps: null, rep_range: { start: 10, end: 12 } }] },
+      { exercise_template_id: "B", rest_seconds: 90, notes: "keep", superset_id: null, sets: [{ type: "normal", weight_kg: 20, reps: 10 }] },
+    ] };
+    const fake: any = async (url: string, init?: any) => {
+      calls.push({ url, init });
+      if (!init?.method) return new Response(JSON.stringify({ page: 1, page_count: 1, routines: [routine] }));
+      return new Response(JSON.stringify({ routine: [{ id: "r1", title: "Push A", exercises: [{}, {}] }] }));
+    };
+    const c = new HevyClient("k", fake);
+    await c.updateRoutine("r1", { exercises: [{ exercise_template_id: "A", notes: "new", sets: [{ weight_kg: 50 }] }] });
+    const put = calls.find((x) => x.init?.method === "PUT");
+    const body = JSON.parse(put.init.body);
+    expect(body.routine.folder_id).toBeUndefined();
+    expect(body.routine.exercises[0].notes).toBe("new");
+    expect(body.routine.exercises[0].sets[0]).toMatchObject({ weight_kg: 50, rep_range: { start: 10, end: 12 } });
+    expect(body.routine.exercises[1].notes).toBe("keep");
+  });
+});
