@@ -9,6 +9,12 @@ export interface AppConfig {
   // restrictAccess=false (default) keeps the server open regardless of the list.
   restrictAccess: boolean;
   allowedWhoopEmails: string[];
+  // Personal integrations (single owner). Hevy/Strava tools are only exposed to users whose
+  // WHOOP email is listed in OWNER_EMAILS (falls back to ALLOWED_WHOOP_EMAILS).
+  ownerEmails: string[];
+  hevyApiKey?: string;
+  stravaClientId?: string;
+  stravaClientSecret?: string;
 }
 
 const Schema = z.object({
@@ -32,10 +38,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const allowedWhoopEmails = (env.ALLOWED_WHOOP_EMAILS ?? "")
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   const restrictAccess = /^(true|1|yes|on)$/i.test((env.RESTRICT_ACCESS ?? "").trim());
+  const ownerEmailsRaw = (env.OWNER_EMAILS ?? "").trim() ? env.OWNER_EMAILS! : (env.ALLOWED_WHOOP_EMAILS ?? "");
+  const ownerEmails = ownerEmailsRaw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const opt = (v: string | undefined) => (v && v.trim() ? v.trim() : undefined);
   return {
     databaseUrl: p.DATABASE_URL, encryptionKey: p.ENCRYPTION_KEY,
     whoopClientId: p.WHOOP_CLIENT_ID, whoopClientSecret: p.WHOOP_CLIENT_SECRET,
     publicBaseUrl: p.PUBLIC_BASE_URL, port: Number(p.PORT),
     sessionSecret: p.SESSION_SECRET, restrictAccess, allowedWhoopEmails,
+    ownerEmails,
+    hevyApiKey: opt(env.HEVY_API_KEY),
+    stravaClientId: opt(env.STRAVA_CLIENT_ID),
+    stravaClientSecret: opt(env.STRAVA_CLIENT_SECRET),
   };
 }

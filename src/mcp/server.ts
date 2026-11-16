@@ -4,6 +4,7 @@ import { WhoopClient } from "../whoop/client.js";
 import { makeToolHandlers, RANGE_SCHEMA } from "./tools.js";
 import type { TokenStore } from "../auth/token-store.js";
 import type { CredentialProvider } from "../whoop/credentials.js";
+import { registerPersonalTools, type PersonalDeps } from "./personal-tools.js";
 
 export function registerWhoopTools(
   server: McpServer,
@@ -25,13 +26,17 @@ export function registerWhoopTools(
     { date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD") }, h.get_daily_summary);
 }
 
-export function buildMcpServer(deps: { tokenStore: TokenStore; credentials: CredentialProvider }): McpServer {
+export function buildMcpServer(deps: { tokenStore: TokenStore; credentials: CredentialProvider; personal?: PersonalDeps }): McpServer {
   const server = new McpServer({ name: "whoop-mcp", version: "0.1.0" });
   const clientFor = (userId: string) =>
     new WhoopClient(
       () => deps.tokenStore.getValidAccessToken(userId),
       async () => deps.tokenStore.forceRefreshAccessToken(userId),
     );
-  registerWhoopTools(server, clientFor, (extra: any) => extra?.authInfo?.extra?.userId);
+  const userIdOf = (extra: any) => extra?.authInfo?.extra?.userId;
+  registerWhoopTools(server, clientFor, userIdOf);
+  if (deps.personal && (deps.personal.hevy || deps.personal.stravaFor)) {
+    registerPersonalTools(server, deps.personal, userIdOf);
+  }
   return server;
 }

@@ -53,3 +53,15 @@ export const pendingAuthorizations = pgTable("pending_authorizations", {
   payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
 });
+
+// Strava OAuth tokens per user (personal integration). Strava rotates refresh tokens,
+// so both are re-encrypted and stored on every refresh.
+export const stravaTokens = pgTable("strava_tokens", {
+  userId: uuid("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  athleteId: text("athlete_id").notNull(),
+  accessTokenEnc: text("access_token_enc").notNull(),
+  refreshTokenEnc: text("refresh_token_enc").notNull(),
+  accessTokenExpiresAt: timestamp("access_token_expires_at", { withTimezone: true }).notNull(),
+  scopes: jsonb("scopes").$type<string[]>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
