@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { DEFAULT_SETTINGS, dueEvents, estimateSleepNeed, morningWakeDate, planNight, typicalWakeTime, type CoachSettings } from "../src/sleep-coach/planner.js";
+import { DEFAULT_SETTINGS, DEBT_CARRY, dueEvents, estimateSleepNeed, fitStrainModel, morningWakeDate, planNight, tonightSleepNeed, typicalWakeTime, type CoachSettings } from "../src/sleep-coach/planner.js";
 import { plannedWorkout } from "../src/sleep-coach/briefing.js";
 import { createHmac } from "node:crypto";
 import express from "express";
@@ -97,6 +97,7 @@ describe("SleepCoach", () => {
     }]),
     getRecovery: vi.fn(async () => [{ sleep_id: "s1", score_state: "SCORED", score: { recovery_score: 72.4 } }]),
     getSleepById: vi.fn(async () => null),
+    getCycles: vi.fn(async () => []),
   };
 
   const make = (now: string, voice = { announce: vi.fn(async () => {}), trigger: vi.fn(async () => {}) }, store = memStore()) => ({
@@ -173,6 +174,7 @@ describe("WHOOP-driven wake-up and morning briefing", () => {
       getSleep: vi.fn(async () => [...Object.values(sleeps), ...history]),
       getRecovery: vi.fn(async () => opts.recs ?? recoveries),
       getSleepById: vi.fn(async (id: string) => sleeps[id]),
+      getCycles: vi.fn(async () => []),
     };
     const coach = new SleepCoach({
       settings: { ...s, scheduledWake: false }, name: "Sooraj", autoWakeTime: true,
@@ -227,10 +229,10 @@ describe("WHOOP-driven wake-up and morning briefing", () => {
     expect(voice.announce).toHaveBeenCalledTimes(1);
   });
 
-  it("waits for WHOOP to finish scoring recovery, then speaks anyway after ~3 minutes", async () => {
+  it("waits for WHOOP to finish scoring recovery, then speaks anyway after ~20 minutes", async () => {
     const { coach, voice, wait } = make("2026-11-18T04:06:00Z", { recs: [{ sleep_id: "main", score_state: "PENDING_SCORE" }], hevy: false });
     await coach.onWhoopEvent({ type: "sleep.updated", id: "main" });
-    expect(wait).toHaveBeenCalledTimes(6);
+    expect(wait).toHaveBeenCalledTimes(40);
     expect(voice.announce).toHaveBeenCalledWith("echo", expect.stringContaining("Your recovery is still being calculated"));
   });
 
@@ -274,6 +276,76 @@ describe("WHOOP-driven wake-up and morning briefing", () => {
     expect(onWhoopEvent).toHaveBeenCalledTimes(1);
     expect(onWhoopEvent).toHaveBeenCalledWith({ type: "sleep.updated", id: "main" });
     expect(verifyWhoopSignature(Buffer.from("{}"), "1", "nope", secret)).toBe(false);
+  });
+});
+
+describe("tonight's sleep need, rebuilt from WHOOP", () => {
+  const H = 3_600_000;
+  const M = 60_000;
+  // Sooraj's real records: night of 16→17 Nov and the cycles around it.
+  const night = (start: string, end: string, sn: any, stages: [number, number, number], extra = {}) => ({
+    start, end, nap: false, score_state: "SCORED", ...extra,
+    score: { sleep_needed: sn, stage_summary: { total_light_sleep_time_milli: stages[0], total_slow_wave_sleep_time_milli: stages[1], total_rem_sleep_time_milli: stages[2] } },
+  });
+  const sleeps = [
+    night("2026-11-16T20:14:36.200Z", "2026-11-17T05:23:36.080Z",
+      { baseline_milli: 27705604, need_from_sleep_debt_milli: 2561799, need_from_recent_strain_milli: 1677324, need_from_recent_nap_milli: 0 },
+      [15752990, 4531200, 8820590]),
+    night("2026-11-15T20:53:34.480Z", "2026-11-16T04:46:15.880Z",
+      { baseline_milli: 27705855, need_from_sleep_debt_milli: 3025697, need_from_recent_strain_milli: 259817, need_from_recent_nap_milli: 0 },
+      [12902690, 6361310, 7742350]),
+    night("2026-11-14T20:07:01.680Z", "2026-11-15T04:05:33.080Z",
+      { baseline_milli: 27706107, need_from_sleep_debt_milli: 4295059, need_from_recent_strain_milli: 1887764, need_from_recent_nap_milli: -2905060 },
+      [11708480, 8466420, 6102330]),
+    night("2026-11-13T21:12:55.080Z", "2026-11-14T03:42:28.320Z",
+      { baseline_milli: 27706358, need_from_sleep_debt_milli: 0, need_from_recent_strain_milli: 1657086, need_from_recent_nap_milli: 0 },
+      [11364640, 3453210, 7864390]),
+    night("2026-11-12T19:55:53.270Z", "2026-11-13T03:39:57.710Z",
+      { baseline_milli: 27706609, need_from_sleep_debt_milli: 7529484, need_from_recent_strain_milli: 238668, need_from_recent_nap_milli: -30823560 },
+      [13884740, 6335200, 6723380]),
+  ];
+  const cycles = [
+    { end: null, score: { strain: 11.704456 } },
+    { end: "2026-11-16T20:14:36.200Z", score: { strain: 13.5908 } },
+    { end: "2026-11-15T20:53:34.480Z", score: { strain: 6.0941553 } },
+    { end: "2026-11-14T20:07:01.680Z", score: { strain: 14.17432 } },
+    { end: "2026-11-13T21:12:55.080Z", score: { strain: 13.532408 } },
+    { end: "2026-11-12T19:55:53.270Z", score: { strain: 5.78438 } },
+  ];
+
+  it("matches WHOOP's sleep-debt rule: 9/14 of the previous night's shortfall", () => {
+    // The 16th's shortfall → the 17th's debt, as WHOOP reported it.
+    const prev = sleeps[1];
+    const sn = prev.score.sleep_needed;
+    const need = sn.baseline_milli + sn.need_from_sleep_debt_milli + sn.need_from_recent_strain_milli;
+    const slept = 12902690 + 6361310 + 7742350;
+    expect(Math.abs(DEBT_CARRY * (need - slept) - 2561799)).toBeLessThan(1000);
+  });
+
+  it("learns the strain curve from history", () => {
+    const m = fitStrainModel(sleeps, cycles);
+    expect(m.points).toBe(5);
+    const minutes = (strain: number) => Math.exp(m.a + m.b * strain);
+    expect(minutes(13.5908)).toBeGreaterThan(24);
+    expect(minutes(13.5908)).toBeLessThan(33);
+    expect(minutes(6.0941553)).toBeGreaterThan(3);
+    expect(minutes(6.0941553)).toBeLessThan(6);
+  });
+
+  it("adds baseline, debt and today's strain; subtracts naps since waking", () => {
+    const n = tonightSleepNeed(sleeps, cycles, s);
+    expect(n.source).toBe("whoop");
+    expect(Math.round(n.baselineMs! / M)).toBe(462);   // 7h 42m
+    expect(Math.round(n.debtMs! / M)).toBe(30);        // 9/14 of 47 min short
+    expect(n.strain).toBeCloseTo(11.7, 1);
+    expect(n.strainMs! / M).toBeGreaterThan(12);
+    expect(n.strainMs! / M).toBeLessThan(24);
+    const nap = { start: "2026-11-17T10:00:00Z", end: "2026-11-17T10:45:00Z", score_state: "SCORED", score: { stage_summary: { total_light_sleep_time_milli: 40 * M } } };
+    expect(n.needMs - tonightSleepNeed([nap, ...sleeps], cycles, s).needMs).toBe(40 * M);
+  });
+
+  it("falls back to the default without a scored main sleep", () => {
+    expect(tonightSleepNeed([], cycles, s)).toEqual({ needMs: 8 * H, source: "default" });
   });
 });
 
