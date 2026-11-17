@@ -138,7 +138,13 @@ export function createSleepCoachRouter(coach: SleepCoach, secret: string, tz: st
       res.json({
         windDown: fmt(p.windDownAt), bedtime: fmt(p.bedtimeAt), wakeUp: fmt(p.wakeAt), usualWakeTime: wakeTime,
         sleepNeedHours: +(p.need.needMs / 3_600_000).toFixed(2), source: p.need.source,
-        carryoverMinutes: p.need.carryoverMs != null ? Math.round(p.need.carryoverMs / 60_000) : undefined,
+        breakdownMinutes: p.need.source === "whoop" ? {
+          baseline: Math.round((p.need.baselineMs ?? 0) / 60_000),
+          sleepDebt: Math.round((p.need.debtMs ?? 0) / 60_000),
+          strain: Math.round((p.need.strainMs ?? 0) / 60_000),
+          naps: -Math.round((p.need.napMs ?? 0) / 60_000),
+        } : undefined,
+        strainToday: p.need.strain != null ? +p.need.strain.toFixed(1) : undefined,
       });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });

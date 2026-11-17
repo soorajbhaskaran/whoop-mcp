@@ -185,10 +185,15 @@ Optional, single-owner feature for the self-hosted server. Your Echo announces w
 down, when to go to bed and when to wake up, and runs your Alexa routines (AC, sounds, music) at
 those moments. Bedtime is worked back from your wake-up time using your WHOOP sleep need:
 
-> tonight's need = your WHOOP baseline need + last night's shortfall (capped at 90 min), clamped to 6–10 h
+> tonight's need = WHOOP baseline + sleep debt + need from today's strain − today's naps (clamped to 6–10 h)
 > bedtime = wake-up time − tonight's need; wind-down = bedtime − `SLEEP_COACH_WIND_DOWN_MINUTES`
 
-The WHOOP API doesn't expose the Sleep Planner itself, so this is an estimate in the same spirit.
+The WHOOP API doesn't expose the Sleep Planner, so the server rebuilds its calculation from the
+`sleep_needed` breakdown WHOOP returns with each night: sleep debt is 9/14 of the previous night's
+shortfall (WHOOP's own rule), and the strain part is a curve fitted nightly to your history of
+"need from recent strain" against the previous day's strain, applied to today's live strain.
+It's refreshed every 15 minutes, so a hard evening workout moves bedtime earlier.
+`GET /sleep-coach/plan` shows the breakdown.
 
 ### 1. Voice Monkey (the bridge to Alexa)
 
@@ -230,8 +235,8 @@ announcement isn't cut off.
 ### Wake up with WHOOP
 
 With `SLEEP_COACH_WAKE_SOURCE=whoop`, your WHOOP alarm (or you) does the waking and Alexa follows:
-when WHOOP finishes recording your night it calls the server, which waits up to 3 minutes for
-recovery to be scored, then the Echo reads a morning briefing and your Morning routine runs:
+when WHOOP finishes recording your night it calls the server, which waits for
+recovery to be scored (up to 20 minutes), then the Echo reads a morning briefing and your Morning routine runs:
 
 > Good morning Sooraj! It's 9:36 AM. You slept 7 hours 40 minutes, a sleep performance of 85 percent.
 > Your recovery is 78 percent, in the green, with an HRV of 139 and a resting heart rate of 50.

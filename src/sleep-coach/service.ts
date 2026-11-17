@@ -1,4 +1,4 @@
-import { dueEvents, estimateSleepNeed, isMainSleep, morningWakeDate, nightIsNear, planNight, typicalWakeTime, type CoachEventKind, type CoachSettings, type NightPlan, type SleepNeed } from "./planner.js";
+import { dueEvents, isMainSleep, tonightSleepNeed, morningWakeDate, nightIsNear, planNight, typicalWakeTime, type CoachEventKind, type CoachSettings, type NightPlan, type SleepNeed } from "./planner.js";
 import { buildMorningBriefing, plannedWorkout } from "./briefing.js";
 import { localDate, spokenDuration, spokenTime } from "./time.js";
 
@@ -8,6 +8,7 @@ export interface WhoopReader {
   getSleep(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
   getRecovery(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
   getSleepById(id: string): Promise<any>;
+  getCycles(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
 }
 
 export interface HevyReader {
@@ -62,7 +63,7 @@ export interface TickResult {
 }
 
 export class SleepCoach {
-  private needCache = new Map<string, SleepNeed>();
+  private needCache?: { at: number; need: SleepNeed };
   private wakeCache?: { date: string; wakeTime: string };
 
   constructor(private d: SleepCoachDeps) {}
@@ -89,22 +90,22 @@ export class SleepCoach {
     return { ...s, wakeTime: this.wakeCache.wakeTime, weekendWakeTime: undefined };
   }
 
-  /** Tonight's sleep need, fetched once per night (keyed by the wake-up date). */
+  /**
+   * Tonight's sleep need from WHOOP: baseline, sleep debt, today's strain (live), naps.
+   * Refreshed every 15 minutes so an evening workout moves bedtime.
+   */
   private async needFor(now: Date, s: CoachSettings): Promise<SleepNeed> {
-    const { wakeDate } = planNight(now, s, { needMs: 0, source: "default" });
-    const hit = this.needCache.get(wakeDate);
-    if (hit) return hit;
-    let need: SleepNeed;
+    if (this.needCache && now.getTime() - this.needCache.at < 15 * 60_000) return this.needCache.need;
     try {
       const client = await this.d.whoop();
-      need = estimateSleepNeed(await client.getSleep({ limit: 5 }), s);
+      const [sleeps, cycles] = await Promise.all([client.getSleep({ limit: 25 }), client.getCycles({ limit: 25 })]);
+      const need = tonightSleepNeed(sleeps, cycles, s);
+      this.needCache = { at: now.getTime(), need };
+      return need;
     } catch (e) {
       this.log(`couldn't read WHOOP sleep need, using default: ${(e as Error).message}`);
       return { needMs: s.defaultNeedMs, source: "default" }; // don't cache; retry next tick
     }
-    this.needCache.clear();
-    this.needCache.set(wakeDate, need);
-    return need;
   }
 
   async plan(): Promise<NightPlan & { wakeTime: string }> {
@@ -188,8 +189,8 @@ export class SleepCoach {
   }
 
   /**
-   * Morning briefing: sleep, recovery, today's workout. Gives WHOOP up to ~3 minutes to finish
-   * scoring recovery first, then speaks and runs the Morning routine.
+   * Morning briefing: sleep, recovery, today's workout. Waits (up to ~20 minutes) until WHOOP has
+   * scored both the sleep and recovery, then speaks and runs the Morning routine.
    */
   private async wake(sleepHint?: any): Promise<string> {
     const s = this.d.settings;
@@ -207,7 +208,7 @@ export class SleepCoach {
         const recs = await client.getRecovery({ limit: 3 });
         recovery = recs.find((r) => sleep && r.sleep_id === sleep.id);
         const ready = sleep?.score_state === "SCORED" && recovery?.score_state === "SCORED";
-        if (ready || !sleepHint || attempt >= 6) break;
+        if (ready || !sleepHint || attempt >= 40) break; // up to ~20 min for WHOOP to finish
         await this.wait(30_000);
       }
     } catch (e) {
