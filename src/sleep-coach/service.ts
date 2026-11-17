@@ -72,6 +72,19 @@ export class SleepCoach {
   private wait(ms: number) { return this.d.wait ? this.d.wait(ms) : new Promise<void>((r) => setTimeout(r, ms)); }
   private log(msg: string) { (this.d.log ?? console.log)(`[sleep-coach] ${msg}`); }
 
+  /**
+   * Speak, then fire the routine only once the speech has finished. Both go through Alexa routines
+   * (the Speaker routine opens the Voice Monkey skill), and a routine that starts mid-announcement
+   * cuts it off — you'd hear only "Voice Monkey is connected" with nothing to say.
+   */
+  private async speakThenTrigger(speech: string, trigger?: string): Promise<void> {
+    await this.d.voice.announce(this.d.devices.speaker, speech);
+    if (!trigger) return;
+    const words = speech.split(/\s+/).length;
+    await this.wait(Math.round((words / 2.5 + 8) * 1000)); // ~150 words/min plus Alexa's start-up
+    await this.d.voice.trigger(trigger);
+  }
+
   /** Settings with the wake time resolved — from your WHOOP history when autoWakeTime is on. */
   async settings(now = this.now()): Promise<CoachSettings> {
     const s = this.d.settings;
@@ -175,16 +188,14 @@ export class SleepCoach {
     if (kind === "wind_down") {
       const speech = `${hi}it's ${at(now)}. Time to start winding down. Lights out at ${at(plan.bedtimeAt)}, `
         + `so you get ${spokenDuration(plan.need.needMs)} of sleep before waking up ${wakeLine}.`;
-      await this.d.voice.announce(dev.speaker, speech);
-      if (dev.windDownTrigger) await this.d.voice.trigger(dev.windDownTrigger);
+      await this.speakThenTrigger(speech, dev.windDownTrigger);
       return speech;
     }
 
     const speech = this.d.autoWakeTime
       ? `${hi}it's ${at(now)}. Time to go to sleep. Phone away, lights off. Good night!`
       : `${hi}it's ${at(now)}. Time to go to sleep. Phone away, lights off. I'll wake you ${wakeLine}. Good night!`;
-    await this.d.voice.announce(dev.speaker, speech);
-    if (dev.bedtimeTrigger) await this.d.voice.trigger(dev.bedtimeTrigger);
+    await this.speakThenTrigger(speech, dev.bedtimeTrigger);
     return speech;
   }
 
@@ -226,8 +237,7 @@ export class SleepCoach {
     }
 
     const speech = buildMorningBriefing({ name: this.d.name, tz: s.tz, now: this.now(), sleep, recovery, workout });
-    await this.d.voice.announce(this.d.devices.speaker, speech);
-    if (this.d.devices.morningTrigger) await this.d.voice.trigger(this.d.devices.morningTrigger);
+    await this.speakThenTrigger(speech, this.d.devices.morningTrigger);
     return speech;
   }
 }
