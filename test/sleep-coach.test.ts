@@ -105,7 +105,7 @@ describe("SleepCoach", () => {
     coach: new SleepCoach({
       settings: s, name: "Sooraj",
       devices: { speaker: "echo", bedtimeTrigger: "bed", morningTrigger: "morning" },
-      whoop: async () => whoop, voice, store, now: () => new Date(now), log: () => {},
+      whoop: async () => whoop, voice, store, now: () => new Date(now), log: () => {}, wait: async () => {},
     }),
   });
 
@@ -114,6 +114,7 @@ describe("SleepCoach", () => {
     expect((await coach.tick()).fired).toEqual(["bedtime:2026-11-18"]);
     expect(voice.announce).toHaveBeenCalledWith("echo", expect.stringMatching(/^Sooraj, it's 10:35 PM\. Time to go to sleep.*6:30 AM/));
     expect(voice.trigger).toHaveBeenCalledWith("bed");
+    expect(voice.announce.mock.invocationCallOrder[0]).toBeLessThan(voice.trigger.mock.invocationCallOrder[0]);
     expect((await coach.tick()).fired).toEqual([]);
     expect(voice.announce).toHaveBeenCalledTimes(1);
   });
@@ -225,6 +226,7 @@ describe("WHOOP-driven wake-up and morning briefing", () => {
       + "Today is Legs A, Quads, starting with Pendulum Squat, 3 sets of 8 to 10. "
       + "You're well recovered, so push it. Have a great day!");
     expect(voice.trigger).toHaveBeenCalledWith("morning");
+    expect(voice.announce.mock.invocationCallOrder[0]).toBeLessThan(voice.trigger.mock.invocationCallOrder[0]);
     expect((await coach.onWhoopEvent({ type: "recovery.updated", id: "main" })).skipped).toMatch(/already fired/);
     expect(voice.announce).toHaveBeenCalledTimes(1);
   });
@@ -232,7 +234,7 @@ describe("WHOOP-driven wake-up and morning briefing", () => {
   it("waits for WHOOP to finish scoring recovery, then speaks anyway after ~20 minutes", async () => {
     const { coach, voice, wait } = make("2026-11-18T04:06:00Z", { recs: [{ sleep_id: "main", score_state: "PENDING_SCORE" }], hevy: false });
     await coach.onWhoopEvent({ type: "sleep.updated", id: "main" });
-    expect(wait).toHaveBeenCalledTimes(40);
+    expect(wait).toHaveBeenCalledTimes(41); // 40 polls + the pause before the Morning routine
     expect(voice.announce).toHaveBeenCalledWith("echo", expect.stringContaining("Your recovery is still being calculated"));
   });
 
