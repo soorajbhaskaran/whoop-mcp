@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { DEFAULT_SETTINGS, dueEvents, estimateSleepNeed, morningWakeDate, planNight, type CoachSettings } from "../src/sleep-coach/planner.js";
+import { DEFAULT_SETTINGS, dueEvents, estimateSleepNeed, morningWakeDate, planNight, typicalWakeTime, type CoachSettings } from "../src/sleep-coach/planner.js";
+import { plannedWorkout } from "../src/sleep-coach/briefing.js";
 import { createHmac } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -55,7 +56,7 @@ describe("dueEvents", () => {
 
 describe("estimateSleepNeed", () => {
   const sleep = (sleptH: number, extra = {}) => ({
-    nap: false, score_state: "SCORED",
+    nap: false, score_state: "SCORED", start: "2026-11-16T20:00:00Z", end: "2026-11-17T04:30:00Z",
     score: {
       sleep_needed: { baseline_milli: 7.5 * H, need_from_sleep_debt_milli: 0, need_from_recent_strain_milli: 0.5 * H, need_from_recent_nap_milli: 0, ...extra },
       stage_summary: { total_light_sleep_time_milli: sleptH * H * 0.5, total_slow_wave_sleep_time_milli: sleptH * H * 0.25, total_rem_sleep_time_milli: sleptH * H * 0.25 },
@@ -71,7 +72,8 @@ describe("estimateSleepNeed", () => {
     expect(estimateSleepNeed([sleep(3, { baseline_milli: 9.5 * H })], s).needMs).toBe(10 * H);
   });
   it("ignores naps and unscored sleeps, falling back to the default", () => {
-    expect(estimateSleepNeed([{ ...sleep(7), nap: true }, { ...sleep(7), score_state: "PENDING_SCORE" }], s))
+    const nap = { ...sleep(7), start: "2026-11-17T10:00:00Z", end: "2026-11-17T10:40:00Z" };
+    expect(estimateSleepNeed([nap, { ...sleep(7), score_state: "PENDING_SCORE" }], s))
       .toEqual({ needMs: 8 * H, source: "default" });
   });
 });
@@ -87,13 +89,13 @@ describe("SleepCoach", () => {
   };
   const whoop = {
     getSleep: vi.fn(async () => [{
-      nap: false, score_state: "SCORED",
+      id: "s1", nap: false, score_state: "SCORED", start: "2026-11-17T16:50:00Z", end: "2026-11-18T00:58:00Z",
       score: {
         sleep_needed: { baseline_milli: 8 * H, need_from_sleep_debt_milli: 0, need_from_recent_strain_milli: 0, need_from_recent_nap_milli: 0 },
         stage_summary: { total_light_sleep_time_milli: 4 * H, total_slow_wave_sleep_time_milli: 2 * H, total_rem_sleep_time_milli: 2 * H + 10 * M },
       },
     }]),
-    getRecovery: vi.fn(async () => [{ score_state: "SCORED", score: { recovery_score: 72.4 } }]),
+    getRecovery: vi.fn(async () => [{ sleep_id: "s1", score_state: "SCORED", score: { recovery_score: 72.4 } }]),
     getSleepById: vi.fn(async () => null),
   };
 
@@ -119,7 +121,7 @@ describe("SleepCoach", () => {
     const { coach, voice } = make("2026-11-18T01:01:00Z"); // 06:31 IST
     await coach.tick();
     expect(voice.announce).toHaveBeenCalledWith("echo",
-      "Good morning Sooraj! It's 6:31 AM, time to wake up. You slept 8 hours 10 minutes, and your recovery is 72 percent. Good day to train hard.");
+      "Good morning Sooraj! It's 6:31 AM. You slept 8 hours 10 minutes. Your recovery is 72 percent, in the green. Have a great day!");
     expect(voice.trigger).toHaveBeenCalledWith("morning");
   });
 
@@ -132,64 +134,124 @@ describe("SleepCoach", () => {
   });
 });
 
-describe("WHOOP-driven wake-up", () => {
+describe("WHOOP-driven wake-up and morning briefing", () => {
+  const H = 3_600_000;
   const memStore = () => {
     const keys = new Set<string>();
     return { keys, async claim(k: string) { if (keys.has(k)) return false; keys.add(k); return true; }, async release(k: string) { keys.delete(k); } };
   };
-  const sleeps: Record<string, any> = {
-    main: { nap: false, score_state: "PENDING_SCORE", start: "2026-11-17T17:10:00Z", end: "2026-11-18T00:42:00Z" }, // 06:12 IST
-    nap: { nap: true, start: "2026-11-18T08:00:00Z", end: "2026-11-18T08:40:00Z" },
-    short: { nap: false, start: "2026-11-17T19:00:00Z", end: "2026-11-17T21:30:00Z" },
-    open: { nap: false, start: "2026-11-17T17:10:00Z", end: null },
+  // Real-shaped records. 18 Nov: 01:40 → 09:32 IST.
+  const scored = {
+    stage_summary: { total_light_sleep_time_milli: 3.5 * H, total_slow_wave_sleep_time_milli: 1.5 * H, total_rem_sleep_time_milli: 2.5 * H + 10 * 60_000 },
+    sleep_performance_percentage: 85,
+    sleep_needed: { baseline_milli: 7.7 * H, need_from_sleep_debt_milli: 0, need_from_recent_strain_milli: 0, need_from_recent_nap_milli: 0 },
   };
-  const make = (now: string) => {
+  const sleeps: Record<string, any> = {
+    main: { id: "main", nap: false, score_state: "SCORED", start: "2026-11-17T20:10:00Z", end: "2026-11-18T04:02:00Z", score: scored },
+    // WHOOP sometimes flags a full night as a nap — still the main sleep.
+    mislabelled: { id: "mislabelled", nap: true, score_state: "SCORED", start: "2026-11-17T18:49:00Z", end: "2026-11-18T03:57:00Z", score: scored },
+    nap: { id: "nap", nap: true, start: "2026-11-18T10:35:00Z", end: "2026-11-18T11:27:00Z" },
+    split: { id: "split", nap: false, start: "2026-11-17T18:47:00Z", end: "2026-11-17T22:23:00Z" }, // ends 03:53 IST
+    open: { id: "open", nap: false, start: "2026-11-17T20:10:00Z", end: null },
+  };
+  const history = ["2026-11-17T04:05:00Z", "2026-11-16T03:55:00Z", "2026-11-15T04:10:00Z"] // ~09:30 IST
+    .map((end) => ({ nap: false, start: new Date(new Date(end).getTime() - 8 * H).toISOString(), end }));
+  const recoveries = [{ sleep_id: "main", score_state: "SCORED", score: { recovery_score: 78, hrv_rmssd_milli: 138.7, resting_heart_rate: 50 } }];
+  const routines = [
+    { title: "Legs A (Quads)", exercises: [
+      { title: "Pendulum Squat (Machine)", sets: [{ type: "warmup", rep_range: { start: 8, end: 10 } }, ...Array(3).fill({ type: "normal", rep_range: { start: 8, end: 10 } })] },
+    ] },
+  ];
+  const rotation = ["Push A (Incline)", "Pull A (Lats)", "Legs A (Quads)", "Push B (Flat)", "Pull B (Back thickness)", "Legs B (Glutes & Hams)"];
+  const hevyWorkouts = [{ title: "Pull A (Lats)", start_time: "2026-11-17T13:11:44+00:00" }, { title: "Push A (Incline)", start_time: "2026-11-16T13:06:58+00:00" }];
+
+  const make = (now: string, opts: { recs?: any[]; hevy?: boolean } = {}) => {
     const voice = { announce: vi.fn(async () => {}), trigger: vi.fn(async () => {}) };
     const store = memStore();
+    const wait = vi.fn(async () => {});
     const whoop = {
-      getSleep: vi.fn(async () => []),
-      getRecovery: vi.fn(async () => []),
+      getSleep: vi.fn(async () => [...Object.values(sleeps), ...history]),
+      getRecovery: vi.fn(async () => opts.recs ?? recoveries),
       getSleepById: vi.fn(async (id: string) => sleeps[id]),
     };
     const coach = new SleepCoach({
-      settings: { ...s, wakeFallbackMinutes: 30 }, name: "Sooraj",
+      settings: { ...s, scheduledWake: false }, name: "Sooraj", autoWakeTime: true,
+      workoutRotation: rotation,
+      hevy: opts.hevy === false ? undefined : { getRoutines: async () => routines, getWorkouts: async () => hevyWorkouts },
       devices: { speaker: "echo", morningTrigger: "morning" },
-      whoop: async () => whoop, voice, store, now: () => new Date(now), log: () => {},
+      whoop: async () => whoop, voice, store, wait, now: () => new Date(now), log: () => {},
     });
-    return { coach, voice, store };
+    return { coach, voice, store, wait, whoop };
   };
 
-  it("moves the scheduled wake-up to the fallback time", () => {
-    const fb = { ...s, wakeFallbackMinutes: 30 };
-    expect(keys("2026-11-18T01:02:00Z", fb)).toEqual([]);              // 06:32 IST
-    expect(keys("2026-11-18T01:31:00Z", fb)).toEqual(["wake:2026-11-18"]); // 07:01 IST
+  it("never schedules a clock-time wake-up when WHOOP drives it", () => {
+    const off = { ...s, scheduledWake: false };
+    expect(keys("2026-11-18T01:02:00Z", off)).toEqual([]);
   });
 
-  it("recognises the morning wake-up window", () => {
-    expect(morningWakeDate(new Date("2026-11-18T00:42:00Z"), s)).toBe("2026-11-18"); // 06:12
-    expect(morningWakeDate(new Date("2026-11-17T21:30:00Z"), s)).toBeNull();         // 03:00
+  it("detects the main morning sleep by length and time, not WHOOP's nap flag", () => {
+    expect(morningWakeDate(sleeps.main, "Asia/Kolkata")).toBe("2026-11-18");
+    expect(morningWakeDate(sleeps.mislabelled, "Asia/Kolkata")).toBe("2026-11-18");
+    expect(morningWakeDate(sleeps.nap, "Asia/Kolkata")).toBeNull();
+    expect(morningWakeDate(sleeps.split, "Asia/Kolkata")).toBeNull();
+    expect(morningWakeDate(sleeps.open, "Asia/Kolkata")).toBeNull();
   });
 
-  it("wakes you as soon as WHOOP reports the main sleep ended, once", async () => {
-    const { coach, voice, store } = make("2026-11-18T00:47:00Z"); // 06:17 IST
+  it("learns the usual wake-up time from WHOOP history", () => {
+    // Sooraj's last nights ended 10:53, 10:16, 09:35, 09:12, 09:09, 09:27, 08:56 IST
+    const ends = ["2026-11-17T05:23:00Z", "2026-11-16T04:46:00Z", "2026-11-15T04:05:00Z", "2026-11-14T03:42:00Z",
+      "2026-11-13T03:39:00Z", "2026-11-12T03:57:00Z", "2026-11-09T03:26:00Z"];
+    const hist = ends.map((end) => ({ start: new Date(new Date(end).getTime() - 8 * H).toISOString(), end }));
+    expect(typicalWakeTime(hist, "Asia/Kolkata", new Date("2026-11-17T18:00:00Z"))).toBe("09:30");
+    expect(typicalWakeTime(hist.slice(0, 2), "Asia/Kolkata", new Date("2026-11-17T18:00:00Z"))).toBeNull();
+  });
+
+  it("plans bedtime back from the learned wake-up time", async () => {
+    const { coach } = make("2026-11-17T15:00:00Z"); // 20:30 IST
+    const p = await coach.plan();
+    expect(p.wakeTime).toBe("09:30");
+    // 7.7h baseline, no shortfall (slept 7h40) → bedtime 01:48 IST
+    expect(p.wakeAt.toISOString()).toBe("2026-11-18T04:00:00.000Z");
+  });
+
+  it("reads the full briefing and runs the Morning routine once WHOOP reports you awake", async () => {
+    const { coach, voice } = make("2026-11-18T04:06:00Z"); // 09:36 IST
     expect(await coach.onWhoopEvent({ type: "sleep.updated", id: "main" })).toEqual({ fired: "wake:2026-11-18" });
     expect(voice.announce).toHaveBeenCalledWith("echo",
-      "Good morning Sooraj! It's 6:17 AM, time to wake up. Your recovery will be ready in WHOOP in a few minutes.");
+      "Good morning Sooraj! It's 9:36 AM. You slept 7 hours 40 minutes, a sleep performance of 85 percent. "
+      + "Your recovery is 78 percent, in the green, with an HRV of 139 and a resting heart rate of 50. "
+      + "Today is Legs A, Quads, starting with Pendulum Squat, 3 sets of 8 to 10. "
+      + "You're well recovered, so push it. Have a great day!");
     expect(voice.trigger).toHaveBeenCalledWith("morning");
     expect((await coach.onWhoopEvent({ type: "recovery.updated", id: "main" })).skipped).toMatch(/already fired/);
-    // and the 07:00 fallback tick does nothing
-    expect(store.keys.has("wake:2026-11-18")).toBe(true);
+    expect(voice.announce).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for WHOOP to finish scoring recovery, then speaks anyway after ~3 minutes", async () => {
+    const { coach, voice, wait } = make("2026-11-18T04:06:00Z", { recs: [{ sleep_id: "main", score_state: "PENDING_SCORE" }], hevy: false });
+    await coach.onWhoopEvent({ type: "sleep.updated", id: "main" });
+    expect(wait).toHaveBeenCalledTimes(6);
+    expect(voice.announce).toHaveBeenCalledWith("echo", expect.stringContaining("Your recovery is still being calculated"));
   });
 
   it("ignores naps, night wake-ups, open sleeps, old sleeps and other events", async () => {
-    const { coach, voice } = make("2026-11-18T08:45:00Z");
+    const { coach, voice } = make("2026-11-18T11:30:00Z");
     expect((await coach.onWhoopEvent({ type: "sleep.updated", id: "nap" })).skipped).toBeTruthy();
     expect((await coach.onWhoopEvent({ type: "sleep.updated", id: "open" })).skipped).toBeTruthy();
     expect((await coach.onWhoopEvent({ type: "sleep.updated", id: "main" })).skipped).toMatch(/over an hour/);
     expect((await coach.onWhoopEvent({ type: "workout.updated", id: "x" })).skipped).toBeTruthy();
-    const early = make("2026-11-17T21:35:00Z").coach;
-    expect((await early.onWhoopEvent({ type: "sleep.updated", id: "short" })).skipped).toBeTruthy();
+    const early = make("2026-11-17T22:30:00Z").coach;
+    expect((await early.onWhoopEvent({ type: "sleep.updated", id: "split" })).skipped).toMatch(/not a morning/);
     expect(voice.announce).not.toHaveBeenCalled();
+  });
+
+  it("picks the next workout in the rotation, wrapping around, and notices one done today", () => {
+    const tz = "Asia/Kolkata";
+    const now = new Date("2026-11-18T04:00:00Z");
+    expect(plannedWorkout(rotation, routines, hevyWorkouts, tz, now)).toMatchObject({ title: "Legs A (Quads)", doneToday: false });
+    expect(plannedWorkout(rotation, [], [{ title: "Legs B (Glutes & Hams)", start_time: "2026-11-17T13:00:00Z" }], tz, now)!.title).toBe("Push A (Incline)");
+    expect(plannedWorkout(rotation, [], [{ title: "Pull A (Lats)", start_time: "2026-11-18T02:00:00Z" }], tz, now)).toMatchObject({ doneToday: true });
+    expect(plannedWorkout([], [], hevyWorkouts, tz, now)).toBeNull();
   });
 
   it("verifies WHOOP webhook signatures and only acts for the owner", async () => {
@@ -229,10 +291,14 @@ describe("sleep coach config", () => {
     const c = loadConfig({ ...base, VOICE_MONKEY_TOKEN: "t", VOICE_MONKEY_SPEAKER: "echo", SLEEP_COACH_SECRET: "x".repeat(16) } as any);
     expect(c.sleepCoach).toMatchObject({ ownerEmail: "me@example.com", timezone: "Asia/Kolkata", wakeTime: "06:30", windDownMinutes: 30 });
   });
-  it("parses the WHOOP wake source with a fallback", () => {
+  it("parses the WHOOP wake source, auto wake time and workout rotation", () => {
     const on = { ...base, VOICE_MONKEY_TOKEN: "t", VOICE_MONKEY_SPEAKER: "echo", SLEEP_COACH_SECRET: "x".repeat(16) };
-    expect(loadConfig(on as any).sleepCoach).toMatchObject({ wakeSource: "time", wakeFallbackMinutes: 0 });
-    expect(loadConfig({ ...on, SLEEP_COACH_WAKE_SOURCE: "whoop" } as any).sleepCoach).toMatchObject({ wakeSource: "whoop", wakeFallbackMinutes: 30 });
+    expect(loadConfig(on as any).sleepCoach).toMatchObject({ wakeSource: "time", autoWakeTime: false, wakeTime: "06:30", workoutRotation: [] });
+    expect(loadConfig({ ...on, SLEEP_COACH_WAKE_SOURCE: "whoop" } as any).sleepCoach).toMatchObject({ wakeSource: "whoop", autoWakeTime: true });
+    expect(loadConfig({ ...on, SLEEP_COACH_WAKE_SOURCE: "whoop", SLEEP_COACH_WAKE_TIME: "09:30" } as any).sleepCoach)
+      .toMatchObject({ autoWakeTime: false, wakeTime: "09:30" });
+    expect(loadConfig({ ...on, SLEEP_COACH_WORKOUT_ROTATION: "Push A (Incline), Pull A (Lats)" } as any).sleepCoach!.workoutRotation)
+      .toEqual(["Push A (Incline)", "Pull A (Lats)"]);
     expect(() => loadConfig({ ...on, SLEEP_COACH_WAKE_SOURCE: "fitbit" } as any)).toThrow(/WAKE_SOURCE/);
   });
   it("rejects bad times and missing pieces", () => {

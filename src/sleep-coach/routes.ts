@@ -6,7 +6,7 @@ import { schema } from "../db/client.js";
 import type { TokenStore } from "../auth/token-store.js";
 import { WhoopClient } from "../whoop/client.js";
 import { DEFAULT_SETTINGS } from "./planner.js";
-import { SleepCoach, type FiredStore } from "./service.js";
+import { SleepCoach, type FiredStore, type HevyReader } from "./service.js";
 import { VoiceMonkey } from "./voice-monkey.js";
 import type { SleepCoachConfig } from "../config.js";
 
@@ -30,7 +30,7 @@ export interface SleepCoachHandle {
   ownerWhoopUserId: () => Promise<string>;
 }
 
-export function createSleepCoach(cfg: SleepCoachConfig, db: Db, tokenStore: TokenStore): SleepCoachHandle {
+export function createSleepCoach(cfg: SleepCoachConfig, db: Db, tokenStore: TokenStore, hevy?: HevyReader): SleepCoachHandle {
   // The coach runs for one person: the WHOOP account whose email is cfg.ownerEmail.
   let owner: { id: string; whoopUserId: string } | undefined;
   const loadOwner = async () => {
@@ -47,8 +47,11 @@ export function createSleepCoach(cfg: SleepCoachConfig, db: Db, tokenStore: Toke
       wakeTime: cfg.wakeTime,
       weekendWakeTime: cfg.weekendWakeTime,
       windDownMinutes: cfg.windDownMinutes,
-      wakeFallbackMinutes: cfg.wakeFallbackMinutes,
+      scheduledWake: cfg.wakeSource === "time",
     },
+    autoWakeTime: cfg.autoWakeTime,
+    workoutRotation: cfg.workoutRotation,
+    hevy,
     devices: cfg.devices,
     name: cfg.name,
     voice: new VoiceMonkey(cfg.voiceMonkeyToken),
@@ -130,9 +133,10 @@ export function createSleepCoachRouter(coach: SleepCoach, secret: string, tz: st
   r.get("/plan", async (_req, res) => {
     try {
       const p = await coach.plan();
+      const wakeTime = p.wakeTime;
       const fmt = (d: Date) => d.toLocaleString("en-IN", { timeZone: tz, dateStyle: "medium", timeStyle: "short" });
       res.json({
-        windDown: fmt(p.windDownAt), bedtime: fmt(p.bedtimeAt), wakeUp: fmt(p.wakeAt),
+        windDown: fmt(p.windDownAt), bedtime: fmt(p.bedtimeAt), wakeUp: fmt(p.wakeAt), usualWakeTime: wakeTime,
         sleepNeedHours: +(p.need.needMs / 3_600_000).toFixed(2), source: p.need.source,
         carryoverMinutes: p.need.carryoverMs != null ? Math.round(p.need.carryoverMs / 60_000) : undefined,
       });
