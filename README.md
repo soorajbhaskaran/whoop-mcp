@@ -179,6 +179,70 @@ unset (or `false`) to keep the server open — the email list is then ignored. T
 server logs a warning at startup if the two are misconfigured (restriction on with
 an empty list, or a list set while restriction is off).
 
+## Sleep coach (Alexa bedtime & wake-up)
+
+Optional, single-owner feature for the self-hosted server. Your Echo announces when to wind
+down, when to go to bed and when to wake up, and runs your Alexa routines (AC, sounds, music) at
+those moments. Bedtime is worked back from your wake-up time using your WHOOP sleep need:
+
+> tonight's need = your WHOOP baseline need + last night's shortfall (capped at 90 min), clamped to 6–10 h
+> bedtime = wake-up time − tonight's need; wind-down = bedtime − `SLEEP_COACH_WIND_DOWN_MINUTES`
+
+The WHOOP API doesn't expose the Sleep Planner itself, so this is an estimate in the same spirit.
+
+### 1. Voice Monkey (the bridge to Alexa)
+
+1. Enable the **Voice Monkey** skill in the Alexa app and sign in at <https://console.voicemonkey.io>.
+2. Create a **Speaker** device mapped to your Echo — its ID is `VOICE_MONKEY_SPEAKER`.
+3. Create up to three **Routine Trigger** devices, e.g. `bedtime`, `morning`, `wind-down`.
+   Their IDs go in `VOICE_MONKEY_BEDTIME_TRIGGER`, `VOICE_MONKEY_MORNING_TRIGGER`,
+   `VOICE_MONKEY_WIND_DOWN_TRIGGER` (all optional — without them you only get announcements).
+4. Copy your API token into `VOICE_MONKEY_TOKEN`.
+
+### 2. Alexa routines
+
+In the Alexa app, create a routine per trigger. "When this happens" → Smart Home → the Voice
+Monkey trigger device. For example:
+
+- **Bedtime**: AC on, Cool, 25 °C, low fan → *Wait 1 minute* → rain sounds on the speaker →
+  *Wait 3 hours* → AC to 27 °C.
+- **Morning**: AC off → *Wait 1 minute* → play music or news.
+
+Start each routine with the device actions and put a short *Wait* before any sound, so the
+announcement isn't cut off.
+
+### 3. Server settings
+
+| Variable | Description |
+|---|---|
+| `VOICE_MONKEY_TOKEN` | Enables the sleep coach. |
+| `VOICE_MONKEY_SPEAKER` | Speaker device ID (required). |
+| `VOICE_MONKEY_*_TRIGGER` | Routine Trigger device IDs (optional). |
+| `SLEEP_COACH_SECRET` | Random string (16+ chars) protecting the `/sleep-coach/*` endpoints. `openssl rand -hex 16` |
+| `SLEEP_COACH_OWNER_EMAIL` | WHOOP email whose data is used. Defaults to the first `OWNER_EMAILS` entry. |
+| `SLEEP_COACH_NAME` | Name Alexa uses ("Good morning, Sooraj!"). |
+| `SLEEP_COACH_TIMEZONE` | Default `Asia/Kolkata`. |
+| `SLEEP_COACH_WAKE_TIME` / `SLEEP_COACH_WEEKEND_WAKE_TIME` | `HH:MM`, 24 h. Weekend applies to Saturday and Sunday mornings. |
+| `SLEEP_COACH_WIND_DOWN_MINUTES` | Heads-up before bedtime, default 30 (`0` = off). |
+
+### 4. Keep it ticking
+
+The server checks every 5 minutes in-process. On hosts that sleep when idle (Render free tier),
+also point a free cron (e.g. cron-job.org) at it every 5 minutes — it keeps the service awake
+and does the check. Each event fires once per night, however many ticks arrive:
+
+```
+https://<your-domain>/sleep-coach/tick?key=<SLEEP_COACH_SECRET>
+```
+
+Useful endpoints (same `?key=` or `Authorization: Bearer`):
+
+- `GET /sleep-coach/plan` — tonight's wind-down, bedtime, wake-up and sleep need.
+- `GET /sleep-coach/test/wind_down` · `/test/bedtime` · `/test/wake` — run one right now.
+
+Keep a normal alarm (WHOOP haptic alarm or an Alexa alarm) as a backup: if the server or Voice
+Monkey is down, the wake-up announcement won't happen.
+
 ## Local Claude Desktop extension (Way B)
 
 A free, local alternative to self-hosting: a `.mcpb` extension that runs as a

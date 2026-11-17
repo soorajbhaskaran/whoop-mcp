@@ -19,6 +19,7 @@ import { StravaTokenStore } from "./strava/token-store.js";
 import { refreshStravaTokens } from "./strava/oauth.js";
 import { createStravaRouter } from "./strava/routes.js";
 import type { PersonalDeps } from "./mcp/personal-tools.js";
+import { createSleepCoach, createSleepCoachRouter } from "./sleep-coach/routes.js";
 
 export function createApp(config: AppConfig): express.Express {
   const app = express();
@@ -63,6 +64,11 @@ export function createApp(config: AppConfig): express.Express {
       creds: stravaCreds, store: stravaStore, sessionSecret: config.sessionSecret,
       publicBaseUrl: config.publicBaseUrl, isOwner,
     }));
+  }
+  if (config.sleepCoach) {
+    const coach = createSleepCoach(config.sleepCoach, db, tokenStore);
+    app.locals.sleepCoach = coach;
+    app.use("/sleep-coach", createSleepCoachRouter(coach, config.sleepCoach.secret, config.sleepCoach.timezone));
   }
   app.use("/dashboard", createDashboardRouter({ provider, tokenStore, sessionSecret: config.sessionSecret }));
 
