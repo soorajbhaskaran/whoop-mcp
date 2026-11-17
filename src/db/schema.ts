@@ -65,3 +65,10 @@ export const stravaTokens = pgTable("strava_tokens", {
   scopes: jsonb("scopes").$type<string[]>().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+// Sleep coach: one row per announcement/routine that has fired (e.g. "bedtime:2026-11-18"),
+// so a restart or overlapping ticks never repeat it.
+export const sleepCoachEvents = pgTable("sleep_coach_events", {
+  eventKey: text("event_key").primaryKey(),
+  firedAt: timestamp("fired_at", { withTimezone: true }).defaultNow().notNull(),
+});

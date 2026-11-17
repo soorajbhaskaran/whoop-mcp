@@ -15,6 +15,60 @@ export interface AppConfig {
   hevyApiKey?: string;
   stravaClientId?: string;
   stravaClientSecret?: string;
+  // Sleep coach (optional): bedtime / wake-up announcements on Alexa via Voice Monkey.
+  sleepCoach?: SleepCoachConfig;
+}
+
+export interface SleepCoachConfig {
+  secret: string;
+  ownerEmail: string;
+  voiceMonkeyToken: string;
+  devices: { speaker: string; windDownTrigger?: string; bedtimeTrigger?: string; morningTrigger?: string };
+  timezone: string;
+  wakeTime: string;
+  weekendWakeTime?: string;
+  windDownMinutes: number;
+  name?: string;
+}
+
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function loadSleepCoach(env: NodeJS.ProcessEnv, ownerEmails: string[]): SleepCoachConfig | undefined {
+  const opt = (v: string | undefined) => (v && v.trim() ? v.trim() : undefined);
+  const token = opt(env.VOICE_MONKEY_TOKEN);
+  if (!token) return undefined;
+  const need = (k: string) => {
+    const v = opt(env[k]);
+    if (!v) throw new Error(`${k} is required when VOICE_MONKEY_TOKEN is set`);
+    return v;
+  };
+  const time = (k: string, fallback?: string) => {
+    const v = opt(env[k]) ?? fallback;
+    if (v !== undefined && !HHMM.test(v)) throw new Error(`${k} must be HH:MM (24h), got "${v}"`);
+    return v;
+  };
+  const ownerEmail = (opt(env.SLEEP_COACH_OWNER_EMAIL) ?? ownerEmails[0])?.toLowerCase();
+  if (!ownerEmail) throw new Error("SLEEP_COACH_OWNER_EMAIL (or OWNER_EMAILS) is required when VOICE_MONKEY_TOKEN is set");
+  const secret = need("SLEEP_COACH_SECRET");
+  if (secret.length < 16) throw new Error("SLEEP_COACH_SECRET must be at least 16 characters");
+  const tz = opt(env.SLEEP_COACH_TIMEZONE) ?? "Asia/Kolkata";
+  try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); } catch { throw new Error(`SLEEP_COACH_TIMEZONE "${tz}" is not a valid IANA time zone`); }
+  const windDown = Number(opt(env.SLEEP_COACH_WIND_DOWN_MINUTES) ?? "30");
+  if (!Number.isInteger(windDown) || windDown < 0 || windDown > 180) throw new Error("SLEEP_COACH_WIND_DOWN_MINUTES must be 0-180");
+  return {
+    secret, ownerEmail, voiceMonkeyToken: token,
+    devices: {
+      speaker: need("VOICE_MONKEY_SPEAKER"),
+      windDownTrigger: opt(env.VOICE_MONKEY_WIND_DOWN_TRIGGER),
+      bedtimeTrigger: opt(env.VOICE_MONKEY_BEDTIME_TRIGGER),
+      morningTrigger: opt(env.VOICE_MONKEY_MORNING_TRIGGER),
+    },
+    timezone: tz,
+    wakeTime: time("SLEEP_COACH_WAKE_TIME", "06:30")!,
+    weekendWakeTime: time("SLEEP_COACH_WEEKEND_WAKE_TIME"),
+    windDownMinutes: windDown,
+    name: opt(env.SLEEP_COACH_NAME),
+  };
 }
 
 const Schema = z.object({
@@ -50,5 +104,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     hevyApiKey: opt(env.HEVY_API_KEY),
     stravaClientId: opt(env.STRAVA_CLIENT_ID),
     stravaClientSecret: opt(env.STRAVA_CLIENT_SECRET),
+    sleepCoach: loadSleepCoach(env, ownerEmails),
   };
 }
