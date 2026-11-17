@@ -13,6 +13,11 @@ export interface CoachSettings {
   maxNeedMs: number;
   maxCarryoverMs: number;     // at most this much of last night's shortfall is added tonight
   eventWindowMs: number;      // an event still fires if a tick arrives up to this late
+  /**
+   * Minutes after wakeTime that the scheduled wake-up fires. 0 = wake exactly at wakeTime.
+   * When WHOOP drives the wake-up, this is the safety net in case WHOOP never reports you awake.
+   */
+  wakeFallbackMinutes: number;
 }
 
 export const DEFAULT_SETTINGS: Omit<CoachSettings, "tz" | "wakeTime"> = {
@@ -22,6 +27,7 @@ export const DEFAULT_SETTINGS: Omit<CoachSettings, "tz" | "wakeTime"> = {
   maxNeedMs: 10 * HOUR,
   maxCarryoverMs: 90 * MIN,
   eventWindowMs: 90 * MIN,
+  wakeFallbackMinutes: 0,
 };
 
 export type CoachEventKind = "wind_down" | "bedtime" | "wake";
@@ -108,9 +114,9 @@ export function dueEvents(now: Date, s: CoachSettings, need: SleepNeed): DueEven
   const out: DueEvent[] = [];
 
   const today = localDate(s.tz, now);
-  const todayWake = wakeInstant(today, s);
-  if (inWindow(todayWake, new Date(todayWake.getTime() + s.eventWindowMs))) {
-    out.push({ kind: "wake", key: `wake:${today}`, at: todayWake });
+  const wakeAt = new Date(wakeInstant(today, s).getTime() + s.wakeFallbackMinutes * MIN);
+  if (inWindow(wakeAt, new Date(wakeAt.getTime() + s.eventWindowMs))) {
+    out.push({ kind: "wake", key: `wake:${today}`, at: wakeAt });
   }
 
   const plan = planNight(now, s, need);
@@ -121,4 +127,16 @@ export function dueEvents(now: Date, s: CoachSettings, need: SleepNeed): DueEven
     out.push({ kind: "bedtime", key: `bedtime:${plan.wakeDate}`, at: plan.bedtimeAt });
   }
   return out;
+}
+
+/**
+ * Is a sleep that ended at `end` your main morning wake-up (not a 3 AM bathroom trip, not a nap)?
+ * True when it ended between 2 hours before and 3 hours after that day's wake time.
+ * Returns the local date the wake-up belongs to, or null.
+ */
+export function morningWakeDate(end: Date, s: CoachSettings): string | null {
+  const date = localDate(s.tz, end);
+  const wake = wakeInstant(date, s).getTime();
+  const t = end.getTime();
+  return t >= wake - 2 * HOUR && t <= wake + 3 * HOUR ? date : null;
 }

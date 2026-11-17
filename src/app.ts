@@ -19,11 +19,12 @@ import { StravaTokenStore } from "./strava/token-store.js";
 import { refreshStravaTokens } from "./strava/oauth.js";
 import { createStravaRouter } from "./strava/routes.js";
 import type { PersonalDeps } from "./mcp/personal-tools.js";
-import { createSleepCoach, createSleepCoachRouter } from "./sleep-coach/routes.js";
+import { createSleepCoach, createSleepCoachRouter, createWhoopWebhookHandler } from "./sleep-coach/routes.js";
 
 export function createApp(config: AppConfig): express.Express {
   const app = express();
-  app.use(express.json());
+  // Keep the raw body too: WHOOP webhook signatures are computed over the exact bytes.
+  app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
   app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
   const db = getDb(config.databaseUrl);
@@ -66,9 +67,10 @@ export function createApp(config: AppConfig): express.Express {
     }));
   }
   if (config.sleepCoach) {
-    const coach = createSleepCoach(config.sleepCoach, db, tokenStore);
-    app.locals.sleepCoach = coach;
-    app.use("/sleep-coach", createSleepCoachRouter(coach, config.sleepCoach.secret, config.sleepCoach.timezone));
+    const handle = createSleepCoach(config.sleepCoach, db, tokenStore);
+    app.locals.sleepCoach = handle.coach;
+    app.post("/sleep-coach/whoop-webhook", createWhoopWebhookHandler(handle, config.whoopClientSecret));
+    app.use("/sleep-coach", createSleepCoachRouter(handle.coach, config.sleepCoach.secret, config.sleepCoach.timezone));
   }
   app.use("/dashboard", createDashboardRouter({ provider, tokenStore, sessionSecret: config.sessionSecret }));
 
