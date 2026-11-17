@@ -224,6 +224,25 @@ announcement isn't cut off.
 | `SLEEP_COACH_TIMEZONE` | Default `Asia/Kolkata`. |
 | `SLEEP_COACH_WAKE_TIME` / `SLEEP_COACH_WEEKEND_WAKE_TIME` | `HH:MM`, 24 h. Weekend applies to Saturday and Sunday mornings. |
 | `SLEEP_COACH_WIND_DOWN_MINUTES` | Heads-up before bedtime, default 30 (`0` = off). |
+| `SLEEP_COACH_WAKE_SOURCE` | `time` (default): wake-up announcement at the wake time. `whoop`: announce as soon as WHOOP records you woke up from your main sleep (see below). |
+| `SLEEP_COACH_WAKE_FALLBACK_MINUTES` | With `whoop`: if WHOOP hasn't reported you awake this long after the wake time, announce anyway. Default 30. |
+
+### Wake up with WHOOP
+
+With `SLEEP_COACH_WAKE_SOURCE=whoop`, your WHOOP alarm (haptic, smart or exact) does the waking and
+Alexa follows: when WHOOP finishes recording your night's sleep it calls the server, and the Echo says
+good morning and runs your Morning routine. Set the wake time to the same time as your WHOOP alarm, so
+bedtime is planned against it.
+
+1. In the [WHOOP Developer Dashboard](https://developer-dashboard.whoop.com/), open your app and set
+   the **Webhook URL** (v2) to `https://<your-domain>/sleep-coach/whoop-webhook`.
+2. Set `SLEEP_COACH_WAKE_SOURCE=whoop` and redeploy.
+
+Calls are verified with WHOOP's signature (your `WHOOP_CLIENT_SECRET`). Only the end of your main
+sleep counts: naps, night-time wake-ups and sleeps that end more than 2 hours before or 3 hours after
+the wake time are ignored. WHOOP needs a few minutes to process the night, so Alexa speaks shortly
+after the alarm rather than at the same second. The WHOOP API doesn't expose alarm settings, so
+the server can't know the alarm time in advance.
 
 ### 4. Keep it ticking
 

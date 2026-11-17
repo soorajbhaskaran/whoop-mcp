@@ -29,6 +29,10 @@ export interface SleepCoachConfig {
   weekendWakeTime?: string;
   windDownMinutes: number;
   name?: string;
+  /** "whoop": wake-up fires when WHOOP reports you awake (webhook); "time": at wakeTime. */
+  wakeSource: "time" | "whoop";
+  /** With wakeSource "whoop": scheduled wake-up this long after wakeTime, if WHOOP stays silent. */
+  wakeFallbackMinutes: number;
 }
 
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -55,8 +59,13 @@ function loadSleepCoach(env: NodeJS.ProcessEnv, ownerEmails: string[]): SleepCoa
   try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); } catch { throw new Error(`SLEEP_COACH_TIMEZONE "${tz}" is not a valid IANA time zone`); }
   const windDown = Number(opt(env.SLEEP_COACH_WIND_DOWN_MINUTES) ?? "30");
   if (!Number.isInteger(windDown) || windDown < 0 || windDown > 180) throw new Error("SLEEP_COACH_WIND_DOWN_MINUTES must be 0-180");
+  const wakeSource = (opt(env.SLEEP_COACH_WAKE_SOURCE) ?? "time").toLowerCase();
+  if (wakeSource !== "time" && wakeSource !== "whoop") throw new Error('SLEEP_COACH_WAKE_SOURCE must be "time" or "whoop"');
+  const fallback = Number(opt(env.SLEEP_COACH_WAKE_FALLBACK_MINUTES) ?? "30");
+  if (!Number.isInteger(fallback) || fallback < 0 || fallback > 180) throw new Error("SLEEP_COACH_WAKE_FALLBACK_MINUTES must be 0-180");
   return {
     secret, ownerEmail, voiceMonkeyToken: token,
+    wakeSource, wakeFallbackMinutes: wakeSource === "whoop" ? fallback : 0,
     devices: {
       speaker: need("VOICE_MONKEY_SPEAKER"),
       windDownTrigger: opt(env.VOICE_MONKEY_WIND_DOWN_TRIGGER),

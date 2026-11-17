@@ -50,6 +50,7 @@ export class WhoopClient {
 
   getRecovery(range?: Range) { return this.collection("/v2/recovery", range); }
   getSleep(range?: Range) { return this.collection("/v2/activity/sleep", range); }
+  getSleepById(id: string) { return this.json<any>(`/v2/activity/sleep/${encodeURIComponent(id)}`); }
   getWorkouts(range?: Range) { return this.collection("/v2/activity/workout", range); }
   getCycles(range?: Range) { return this.collection("/v2/cycle", range); }
   getProfile() { return this.json<any>("/v2/user/profile/basic"); }

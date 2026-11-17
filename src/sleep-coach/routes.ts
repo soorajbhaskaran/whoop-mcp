@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import express from "express";
 import { eq, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -24,22 +24,30 @@ export class DbFiredStore implements FiredStore {
   }
 }
 
-export function createSleepCoach(cfg: SleepCoachConfig, db: Db, tokenStore: TokenStore): SleepCoach {
+export interface SleepCoachHandle {
+  coach: SleepCoach;
+  /** The owner's WHOOP user id (as in webhook payloads). */
+  ownerWhoopUserId: () => Promise<string>;
+}
+
+export function createSleepCoach(cfg: SleepCoachConfig, db: Db, tokenStore: TokenStore): SleepCoachHandle {
   // The coach runs for one person: the WHOOP account whose email is cfg.ownerEmail.
-  let userId: string | undefined;
-  const ownerUserId = async () => {
-    if (userId) return userId;
+  let owner: { id: string; whoopUserId: string } | undefined;
+  const loadOwner = async () => {
+    if (owner) return owner;
     const [u] = await db.select().from(schema.users).where(sql`lower(${schema.users.email}) = ${cfg.ownerEmail}`);
     if (!u) throw new Error(`no connected WHOOP user with email ${cfg.ownerEmail}`);
-    return (userId = u.id);
+    return (owner = { id: u.id, whoopUserId: u.whoopUserId });
   };
-  return new SleepCoach({
+  const ownerUserId = async () => (await loadOwner()).id;
+  const coach = new SleepCoach({
     settings: {
       ...DEFAULT_SETTINGS,
       tz: cfg.timezone,
       wakeTime: cfg.wakeTime,
       weekendWakeTime: cfg.weekendWakeTime,
       windDownMinutes: cfg.windDownMinutes,
+      wakeFallbackMinutes: cfg.wakeFallbackMinutes,
     },
     devices: cfg.devices,
     name: cfg.name,
@@ -50,6 +58,44 @@ export function createSleepCoach(cfg: SleepCoachConfig, db: Db, tokenStore: Toke
       return new WhoopClient(() => tokenStore.getValidAccessToken(uid), () => tokenStore.forceRefreshAccessToken(uid));
     },
   });
+  return { coach, ownerWhoopUserId: async () => (await loadOwner()).whoopUserId };
+}
+
+/** WHOOP webhook signature: base64(HMAC-SHA256(client secret, timestamp + raw body)). */
+export function verifyWhoopSignature(rawBody: Buffer, timestamp: string, signature: string, clientSecret: string): boolean {
+  const expected = createHmac("sha256", clientSecret).update(timestamp).update(rawBody).digest("base64");
+  return secretMatches(signature, expected);
+}
+
+/**
+ * POST /sleep-coach/whoop-webhook — set this as the webhook URL in the WHOOP developer dashboard.
+ * WHOOP signs each call; we answer 204 at once and handle the event in the background.
+ */
+export function createWhoopWebhookHandler(handle: SleepCoachHandle, clientSecret: string): express.RequestHandler {
+  return (req, res) => {
+    const raw = (req as any).rawBody as Buffer | undefined;
+    const sig = req.get("X-WHOOP-Signature");
+    const ts = req.get("X-WHOOP-Signature-Timestamp");
+    if (!raw || !sig || !ts || !verifyWhoopSignature(raw, ts, sig, clientSecret)) {
+      res.status(401).json({ error: "bad signature" });
+      return;
+    }
+    if (Math.abs(Date.now() - Number(ts)) > 10 * 60_000) {
+      res.status(401).json({ error: "stale timestamp" });
+      return;
+    }
+    res.status(204).end();
+    const ev = req.body as { user_id?: number | string; id?: string; type?: string };
+    void (async () => {
+      try {
+        if (String(ev.user_id) !== (await handle.ownerWhoopUserId())) return; // someone else on this server
+        const r = await handle.coach.onWhoopEvent({ type: String(ev.type), id: String(ev.id) });
+        if (r.fired) console.log(`[sleep-coach] webhook ${ev.type} -> ${r.fired}`);
+      } catch (e) {
+        console.error(`[sleep-coach] webhook ${ev.type} failed:`, (e as Error).message);
+      }
+    })();
+  };
 }
 
 function secretMatches(given: unknown, secret: string): boolean {

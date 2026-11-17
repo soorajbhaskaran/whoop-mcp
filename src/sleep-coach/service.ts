@@ -1,4 +1,4 @@
-import { dueEvents, estimateSleepNeed, nightIsNear, planNight, type CoachEventKind, type CoachSettings, type NightPlan, type SleepNeed } from "./planner.js";
+import { dueEvents, estimateSleepNeed, morningWakeDate, nightIsNear, planNight, type CoachEventKind, type CoachSettings, type NightPlan, type SleepNeed } from "./planner.js";
 import { spokenDuration, spokenTime } from "./time.js";
 
 const HOUR = 3_600_000;
@@ -6,6 +6,12 @@ const HOUR = 3_600_000;
 export interface WhoopReader {
   getSleep(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
   getRecovery(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
+  getSleepById(id: string): Promise<any>;
+}
+
+export interface WhoopEvent {
+  type: string;
+  id: string; // v2: the sleep's UUID for both sleep.* and recovery.* events
 }
 
 export interface Announcer {
@@ -96,6 +102,34 @@ export class SleepCoach {
     return result;
   }
 
+  /**
+   * React to a WHOOP webhook. When WHOOP records that you've woken up from your main sleep,
+   * fire the morning wake-up right away (the scheduled one becomes a no-op for that day).
+   */
+  async onWhoopEvent(ev: WhoopEvent): Promise<{ fired?: string; skipped?: string }> {
+    if (ev.type !== "sleep.updated" && ev.type !== "recovery.updated") return { skipped: `ignored ${ev.type}` };
+    const client = await this.d.whoop();
+    const sleep = await client.getSleepById(String(ev.id));
+    if (!sleep?.end || sleep.nap) return { skipped: "nap or sleep still in progress" };
+    const start = new Date(sleep.start).getTime();
+    const end = new Date(sleep.end);
+    const now = this.now();
+    if (end.getTime() - start < 3 * HOUR) return { skipped: "too short to be the main sleep" };
+    if (now.getTime() - end.getTime() > HOUR) return { skipped: "sleep ended over an hour ago" };
+    const date = morningWakeDate(end, this.d.settings);
+    if (!date) return { skipped: "not a morning wake-up" };
+    const key = `wake:${date}`;
+    if (!(await this.d.store.claim(key))) return { skipped: `${key} already fired` };
+    try {
+      await this.run("wake", now);
+      this.log(`fired ${key} from WHOOP ${ev.type}`);
+      return { fired: key };
+    } catch (e) {
+      await this.d.store.release(key);
+      throw e;
+    }
+  }
+
   /** Run one event right now, ignoring the schedule (used by the /test endpoint). */
   async run(kind: CoachEventKind, now = this.now()): Promise<string> {
     const s = this.d.settings;
@@ -146,7 +180,7 @@ export class SleepCoach {
       const parts: string[] = [];
       if (sleptMs > 0) parts.push(`You slept ${spokenDuration(sleptMs)}`);
       if (typeof rec === "number") parts.push(`your recovery is ${Math.round(rec)} percent`);
-      if (parts.length === 0) return "";
+      if (parts.length === 0) return "Your recovery will be ready in WHOOP in a few minutes.";
       const line = parts.join(", and ") + ".";
       const tip = typeof rec === "number"
         ? rec >= 67 ? " Good day to train hard." : rec < 34 ? " Take it easy today." : ""

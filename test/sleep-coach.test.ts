@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
-import { DEFAULT_SETTINGS, dueEvents, estimateSleepNeed, planNight, type CoachSettings } from "../src/sleep-coach/planner.js";
+import { DEFAULT_SETTINGS, dueEvents, estimateSleepNeed, morningWakeDate, planNight, type CoachSettings } from "../src/sleep-coach/planner.js";
+import { createHmac } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { createWhoopWebhookHandler, verifyWhoopSignature } from "../src/sleep-coach/routes.js";
 import { SleepCoach, type FiredStore } from "../src/sleep-coach/service.js";
 import { zonedInstant, spokenDuration } from "../src/sleep-coach/time.js";
 import { loadConfig } from "../src/config.js";
@@ -90,7 +94,9 @@ describe("SleepCoach", () => {
       },
     }]),
     getRecovery: vi.fn(async () => [{ score_state: "SCORED", score: { recovery_score: 72.4 } }]),
+    getSleepById: vi.fn(async () => null),
   };
+
   const make = (now: string, voice = { announce: vi.fn(async () => {}), trigger: vi.fn(async () => {}) }, store = memStore()) => ({
     voice, store,
     coach: new SleepCoach({
@@ -126,6 +132,89 @@ describe("SleepCoach", () => {
   });
 });
 
+describe("WHOOP-driven wake-up", () => {
+  const memStore = () => {
+    const keys = new Set<string>();
+    return { keys, async claim(k: string) { if (keys.has(k)) return false; keys.add(k); return true; }, async release(k: string) { keys.delete(k); } };
+  };
+  const sleeps: Record<string, any> = {
+    main: { nap: false, score_state: "PENDING_SCORE", start: "2026-11-17T17:10:00Z", end: "2026-11-18T00:42:00Z" }, // 06:12 IST
+    nap: { nap: true, start: "2026-11-18T08:00:00Z", end: "2026-11-18T08:40:00Z" },
+    short: { nap: false, start: "2026-11-17T19:00:00Z", end: "2026-11-17T21:30:00Z" },
+    open: { nap: false, start: "2026-11-17T17:10:00Z", end: null },
+  };
+  const make = (now: string) => {
+    const voice = { announce: vi.fn(async () => {}), trigger: vi.fn(async () => {}) };
+    const store = memStore();
+    const whoop = {
+      getSleep: vi.fn(async () => []),
+      getRecovery: vi.fn(async () => []),
+      getSleepById: vi.fn(async (id: string) => sleeps[id]),
+    };
+    const coach = new SleepCoach({
+      settings: { ...s, wakeFallbackMinutes: 30 }, name: "Sooraj",
+      devices: { speaker: "echo", morningTrigger: "morning" },
+      whoop: async () => whoop, voice, store, now: () => new Date(now), log: () => {},
+    });
+    return { coach, voice, store };
+  };
+
+  it("moves the scheduled wake-up to the fallback time", () => {
+    const fb = { ...s, wakeFallbackMinutes: 30 };
+    expect(keys("2026-11-18T01:02:00Z", fb)).toEqual([]);              // 06:32 IST
+    expect(keys("2026-11-18T01:31:00Z", fb)).toEqual(["wake:2026-11-18"]); // 07:01 IST
+  });
+
+  it("recognises the morning wake-up window", () => {
+    expect(morningWakeDate(new Date("2026-11-18T00:42:00Z"), s)).toBe("2026-11-18"); // 06:12
+    expect(morningWakeDate(new Date("2026-11-17T21:30:00Z"), s)).toBeNull();         // 03:00
+  });
+
+  it("wakes you as soon as WHOOP reports the main sleep ended, once", async () => {
+    const { coach, voice, store } = make("2026-11-18T00:47:00Z"); // 06:17 IST
+    expect(await coach.onWhoopEvent({ type: "sleep.updated", id: "main" })).toEqual({ fired: "wake:2026-11-18" });
+    expect(voice.announce).toHaveBeenCalledWith("echo",
+      "Good morning Sooraj! It's 6:17 AM, time to wake up. Your recovery will be ready in WHOOP in a few minutes.");
+    expect(voice.trigger).toHaveBeenCalledWith("morning");
+    expect((await coach.onWhoopEvent({ type: "recovery.updated", id: "main" })).skipped).toMatch(/already fired/);
+    // and the 07:00 fallback tick does nothing
+    expect(store.keys.has("wake:2026-11-18")).toBe(true);
+  });
+
+  it("ignores naps, night wake-ups, open sleeps, old sleeps and other events", async () => {
+    const { coach, voice } = make("2026-11-18T08:45:00Z");
+    expect((await coach.onWhoopEvent({ type: "sleep.updated", id: "nap" })).skipped).toBeTruthy();
+    expect((await coach.onWhoopEvent({ type: "sleep.updated", id: "open" })).skipped).toBeTruthy();
+    expect((await coach.onWhoopEvent({ type: "sleep.updated", id: "main" })).skipped).toMatch(/over an hour/);
+    expect((await coach.onWhoopEvent({ type: "workout.updated", id: "x" })).skipped).toBeTruthy();
+    const early = make("2026-11-17T21:35:00Z").coach;
+    expect((await early.onWhoopEvent({ type: "sleep.updated", id: "short" })).skipped).toBeTruthy();
+    expect(voice.announce).not.toHaveBeenCalled();
+  });
+
+  it("verifies WHOOP webhook signatures and only acts for the owner", async () => {
+    const secret = "client-secret";
+    const onWhoopEvent = vi.fn(async () => ({ fired: "wake:x" }));
+    const app = express();
+    app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
+    app.post("/hook", createWhoopWebhookHandler({ coach: { onWhoopEvent } as any, ownerWhoopUserId: async () => "42" }, secret));
+    const send = (body: object, sign = true) => {
+      const raw = JSON.stringify(body);
+      const ts = String(Date.now());
+      const sig = createHmac("sha256", sign ? secret : "wrong").update(ts + raw).digest("base64");
+      return request(app).post("/hook").set("Content-Type", "application/json")
+        .set("X-WHOOP-Signature", sig).set("X-WHOOP-Signature-Timestamp", ts).send(raw);
+    };
+    expect((await send({ user_id: 42, id: "main", type: "sleep.updated" }, false)).status).toBe(401);
+    expect((await send({ user_id: 7, id: "main", type: "sleep.updated" })).status).toBe(204);
+    expect((await send({ user_id: 42, id: "main", type: "sleep.updated" })).status).toBe(204);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(onWhoopEvent).toHaveBeenCalledTimes(1);
+    expect(onWhoopEvent).toHaveBeenCalledWith({ type: "sleep.updated", id: "main" });
+    expect(verifyWhoopSignature(Buffer.from("{}"), "1", "nope", secret)).toBe(false);
+  });
+});
+
 describe("sleep coach config", () => {
   const base = {
     DATABASE_URL: "postgres://x", ENCRYPTION_KEY: "a".repeat(64),
@@ -139,6 +228,12 @@ describe("sleep coach config", () => {
   it("parses settings with defaults", () => {
     const c = loadConfig({ ...base, VOICE_MONKEY_TOKEN: "t", VOICE_MONKEY_SPEAKER: "echo", SLEEP_COACH_SECRET: "x".repeat(16) } as any);
     expect(c.sleepCoach).toMatchObject({ ownerEmail: "me@example.com", timezone: "Asia/Kolkata", wakeTime: "06:30", windDownMinutes: 30 });
+  });
+  it("parses the WHOOP wake source with a fallback", () => {
+    const on = { ...base, VOICE_MONKEY_TOKEN: "t", VOICE_MONKEY_SPEAKER: "echo", SLEEP_COACH_SECRET: "x".repeat(16) };
+    expect(loadConfig(on as any).sleepCoach).toMatchObject({ wakeSource: "time", wakeFallbackMinutes: 0 });
+    expect(loadConfig({ ...on, SLEEP_COACH_WAKE_SOURCE: "whoop" } as any).sleepCoach).toMatchObject({ wakeSource: "whoop", wakeFallbackMinutes: 30 });
+    expect(() => loadConfig({ ...on, SLEEP_COACH_WAKE_SOURCE: "fitbit" } as any)).toThrow(/WAKE_SOURCE/);
   });
   it("rejects bad times and missing pieces", () => {
     const on = { ...base, VOICE_MONKEY_TOKEN: "t", VOICE_MONKEY_SPEAKER: "echo", SLEEP_COACH_SECRET: "x".repeat(16) };
