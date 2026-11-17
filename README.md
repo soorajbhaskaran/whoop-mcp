@@ -222,27 +222,33 @@ announcement isn't cut off.
 | `SLEEP_COACH_OWNER_EMAIL` | WHOOP email whose data is used. Defaults to the first `OWNER_EMAILS` entry. |
 | `SLEEP_COACH_NAME` | Name Alexa uses ("Good morning, Sooraj!"). |
 | `SLEEP_COACH_TIMEZONE` | Default `Asia/Kolkata`. |
-| `SLEEP_COACH_WAKE_TIME` / `SLEEP_COACH_WEEKEND_WAKE_TIME` | `HH:MM`, 24 h. Weekend applies to Saturday and Sunday mornings. |
+| `SLEEP_COACH_WAKE_TIME` / `SLEEP_COACH_WEEKEND_WAKE_TIME` | `HH:MM`, 24 h, or `auto` (the default with `SLEEP_COACH_WAKE_SOURCE=whoop`): your usual wake-up, the median of the last two weeks of WHOOP mornings, rounded to 15 min. Weekend applies to Saturday and Sunday mornings. |
 | `SLEEP_COACH_WIND_DOWN_MINUTES` | Heads-up before bedtime, default 30 (`0` = off). |
-| `SLEEP_COACH_WAKE_SOURCE` | `time` (default): wake-up announcement at the wake time. `whoop`: announce as soon as WHOOP records you woke up from your main sleep (see below). |
-| `SLEEP_COACH_WAKE_FALLBACK_MINUTES` | With `whoop`: if WHOOP hasn't reported you awake this long after the wake time, announce anyway. Default 30. |
+| `SLEEP_COACH_WAKE_SOURCE` | `time` (default): good-morning at the wake time. `whoop`: good-morning as soon as WHOOP records you woke up from your main sleep, and no clock-time wake-up at all (see below). |
+| `SLEEP_COACH_WORKOUT_ROTATION` | Optional. Your Hevy routine titles in training order, comma-separated, e.g. `Push A (Incline),Pull A (Lats),Legs A (Quads)`. The briefing names the routine after your last logged one. Needs `HEVY_API_KEY`. |
 
 ### Wake up with WHOOP
 
-With `SLEEP_COACH_WAKE_SOURCE=whoop`, your WHOOP alarm (haptic, smart or exact) does the waking and
-Alexa follows: when WHOOP finishes recording your night's sleep it calls the server, and the Echo says
-good morning and runs your Morning routine. Set the wake time to the same time as your WHOOP alarm, so
-bedtime is planned against it.
+With `SLEEP_COACH_WAKE_SOURCE=whoop`, your WHOOP alarm (or you) does the waking and Alexa follows:
+when WHOOP finishes recording your night it calls the server, which waits up to 3 minutes for
+recovery to be scored, then the Echo reads a morning briefing and your Morning routine runs:
+
+> Good morning Sooraj! It's 9:36 AM. You slept 7 hours 40 minutes, a sleep performance of 85 percent.
+> Your recovery is 78 percent, in the green, with an HRV of 139 and a resting heart rate of 50.
+> Today is Legs A, Quads, starting with Pendulum Squat, 3 sets of 8 to 10. You're well recovered,
+> so push it. Have a great day!
+
+There is no clock-time wake-up in this mode. Bedtime is planned back from your usual wake-up time
+(`SLEEP_COACH_WAKE_TIME=auto`).
 
 1. In the [WHOOP Developer Dashboard](https://developer-dashboard.whoop.com/), open your app and set
    the **Webhook URL** (v2) to `https://<your-domain>/sleep-coach/whoop-webhook`.
 2. Set `SLEEP_COACH_WAKE_SOURCE=whoop` and redeploy.
 
-Calls are verified with WHOOP's signature (your `WHOOP_CLIENT_SECRET`). Only the end of your main
-sleep counts: naps, night-time wake-ups and sleeps that end more than 2 hours before or 3 hours after
-the wake time are ignored. WHOOP needs a few minutes to process the night, so Alexa speaks shortly
-after the alarm rather than at the same second. The WHOOP API doesn't expose alarm settings, so
-the server can't know the alarm time in advance.
+Calls are verified with WHOOP's signature (your `WHOOP_CLIENT_SECRET`). The main sleep is the one
+lasting 3 hours or more that ends between 04:30 and 14:00 local time — WHOOP's own nap flag isn't
+trusted, as it sometimes marks a full night as a nap. Naps, 3 AM wake-ups and afternoon sleeps are
+ignored, and the briefing plays once per morning.
 
 ### 4. Keep it ticking
 

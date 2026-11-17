@@ -67,7 +67,7 @@ export function createApp(config: AppConfig): express.Express {
     }));
   }
   if (config.sleepCoach) {
-    const handle = createSleepCoach(config.sleepCoach, db, tokenStore);
+    const handle = createSleepCoach(config.sleepCoach, db, tokenStore, personal.hevy);
     app.locals.sleepCoach = handle.coach;
     app.post("/sleep-coach/whoop-webhook", createWhoopWebhookHandler(handle, config.whoopClientSecret));
     app.use("/sleep-coach", createSleepCoachRouter(handle.coach, config.sleepCoach.secret, config.sleepCoach.timezone));

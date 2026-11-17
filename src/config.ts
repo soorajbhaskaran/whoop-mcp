@@ -31,8 +31,10 @@ export interface SleepCoachConfig {
   name?: string;
   /** "whoop": wake-up fires when WHOOP reports you awake (webhook); "time": at wakeTime. */
   wakeSource: "time" | "whoop";
-  /** With wakeSource "whoop": scheduled wake-up this long after wakeTime, if WHOOP stays silent. */
-  wakeFallbackMinutes: number;
+  /** Plan bedtime from your usual WHOOP wake-up time (SLEEP_COACH_WAKE_TIME=auto). */
+  autoWakeTime: boolean;
+  /** Hevy routine titles in training order, for "today is …" in the morning briefing. */
+  workoutRotation: string[];
 }
 
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -48,6 +50,7 @@ function loadSleepCoach(env: NodeJS.ProcessEnv, ownerEmails: string[]): SleepCoa
   };
   const time = (k: string, fallback?: string) => {
     const v = opt(env[k]) ?? fallback;
+    if (v === "auto") return undefined;
     if (v !== undefined && !HHMM.test(v)) throw new Error(`${k} must be HH:MM (24h), got "${v}"`);
     return v;
   };
@@ -61,11 +64,13 @@ function loadSleepCoach(env: NodeJS.ProcessEnv, ownerEmails: string[]): SleepCoa
   if (!Number.isInteger(windDown) || windDown < 0 || windDown > 180) throw new Error("SLEEP_COACH_WIND_DOWN_MINUTES must be 0-180");
   const wakeSource = (opt(env.SLEEP_COACH_WAKE_SOURCE) ?? "time").toLowerCase();
   if (wakeSource !== "time" && wakeSource !== "whoop") throw new Error('SLEEP_COACH_WAKE_SOURCE must be "time" or "whoop"');
-  const fallback = Number(opt(env.SLEEP_COACH_WAKE_FALLBACK_MINUTES) ?? "30");
-  if (!Number.isInteger(fallback) || fallback < 0 || fallback > 180) throw new Error("SLEEP_COACH_WAKE_FALLBACK_MINUTES must be 0-180");
+  // With WHOOP driving the wake-up, the wake time defaults to "auto": your usual one from WHOOP.
+  const wakeRaw = opt(env.SLEEP_COACH_WAKE_TIME) ?? (wakeSource === "whoop" ? "auto" : "06:30");
+  const autoWakeTime = wakeRaw.toLowerCase() === "auto";
   return {
     secret, ownerEmail, voiceMonkeyToken: token,
-    wakeSource, wakeFallbackMinutes: wakeSource === "whoop" ? fallback : 0,
+    wakeSource, autoWakeTime,
+    workoutRotation: (opt(env.SLEEP_COACH_WORKOUT_ROTATION) ?? "").split(",").map((t) => t.trim()).filter(Boolean),
     devices: {
       speaker: need("VOICE_MONKEY_SPEAKER"),
       windDownTrigger: opt(env.VOICE_MONKEY_WIND_DOWN_TRIGGER),
@@ -73,7 +78,8 @@ function loadSleepCoach(env: NodeJS.ProcessEnv, ownerEmails: string[]): SleepCoa
       morningTrigger: opt(env.VOICE_MONKEY_MORNING_TRIGGER),
     },
     timezone: tz,
-    wakeTime: time("SLEEP_COACH_WAKE_TIME", "06:30")!,
+    // Used directly, or as the fallback when "auto" has under 3 nights of history.
+    wakeTime: autoWakeTime ? "08:00" : time("SLEEP_COACH_WAKE_TIME", wakeRaw)!,
     weekendWakeTime: time("SLEEP_COACH_WEEKEND_WAKE_TIME"),
     windDownMinutes: windDown,
     name: opt(env.SLEEP_COACH_NAME),

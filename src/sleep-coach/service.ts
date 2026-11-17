@@ -1,5 +1,6 @@
-import { dueEvents, estimateSleepNeed, morningWakeDate, nightIsNear, planNight, type CoachEventKind, type CoachSettings, type NightPlan, type SleepNeed } from "./planner.js";
-import { spokenDuration, spokenTime } from "./time.js";
+import { dueEvents, estimateSleepNeed, isMainSleep, morningWakeDate, nightIsNear, planNight, typicalWakeTime, type CoachEventKind, type CoachSettings, type NightPlan, type SleepNeed } from "./planner.js";
+import { buildMorningBriefing, plannedWorkout } from "./briefing.js";
+import { localDate, spokenDuration, spokenTime } from "./time.js";
 
 const HOUR = 3_600_000;
 
@@ -7,6 +8,11 @@ export interface WhoopReader {
   getSleep(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
   getRecovery(range?: { start?: string; end?: string; limit?: number }): Promise<any[]>;
   getSleepById(id: string): Promise<any>;
+}
+
+export interface HevyReader {
+  getWorkouts(opts?: { since?: string; until?: string; maxWorkouts?: number }): Promise<any[]>;
+  getRoutines(): Promise<any[]>;
 }
 
 export interface WhoopEvent {
@@ -37,10 +43,16 @@ export interface SleepCoachDeps {
   settings: CoachSettings;
   devices: CoachDevices;
   name?: string;
+  /** Plan bedtime from your usual WHOOP wake-up time instead of settings.wakeTime. */
+  autoWakeTime?: boolean;
+  /** Hevy routine titles in the order you train them, for "today is …" in the briefing. */
+  workoutRotation?: string[];
   whoop: () => Promise<WhoopReader>;
+  hevy?: HevyReader;
   voice: Announcer;
   store: FiredStore;
   now?: () => Date;
+  wait?: (ms: number) => Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -51,41 +63,62 @@ export interface TickResult {
 
 export class SleepCoach {
   private needCache = new Map<string, SleepNeed>();
+  private wakeCache?: { date: string; wakeTime: string };
 
   constructor(private d: SleepCoachDeps) {}
 
   private now() { return this.d.now?.() ?? new Date(); }
+  private wait(ms: number) { return this.d.wait ? this.d.wait(ms) : new Promise<void>((r) => setTimeout(r, ms)); }
   private log(msg: string) { (this.d.log ?? console.log)(`[sleep-coach] ${msg}`); }
 
+  /** Settings with the wake time resolved — from your WHOOP history when autoWakeTime is on. */
+  async settings(now = this.now()): Promise<CoachSettings> {
+    const s = this.d.settings;
+    if (!this.d.autoWakeTime) return s;
+    const today = localDate(s.tz, now);
+    if (this.wakeCache?.date !== today) {
+      try {
+        const client = await this.d.whoop();
+        const typical = typicalWakeTime(await client.getSleep({ limit: 25 }), s.tz, now);
+        this.wakeCache = { date: today, wakeTime: typical ?? s.wakeTime };
+      } catch (e) {
+        this.log(`couldn't read WHOOP history for the wake time, using ${s.wakeTime}: ${(e as Error).message}`);
+        return s; // don't cache; retry next time
+      }
+    }
+    return { ...s, wakeTime: this.wakeCache.wakeTime, weekendWakeTime: undefined };
+  }
+
   /** Tonight's sleep need, fetched once per night (keyed by the wake-up date). */
-  private async needFor(now: Date): Promise<SleepNeed> {
-    const { wakeDate } = planNight(now, this.d.settings, { needMs: 0, source: "default" });
+  private async needFor(now: Date, s: CoachSettings): Promise<SleepNeed> {
+    const { wakeDate } = planNight(now, s, { needMs: 0, source: "default" });
     const hit = this.needCache.get(wakeDate);
     if (hit) return hit;
     let need: SleepNeed;
     try {
       const client = await this.d.whoop();
-      need = estimateSleepNeed(await client.getSleep({ limit: 5 }), this.d.settings);
+      need = estimateSleepNeed(await client.getSleep({ limit: 5 }), s);
     } catch (e) {
       this.log(`couldn't read WHOOP sleep need, using default: ${(e as Error).message}`);
-      return { needMs: this.d.settings.defaultNeedMs, source: "default" }; // don't cache; retry next tick
+      return { needMs: s.defaultNeedMs, source: "default" }; // don't cache; retry next tick
     }
     this.needCache.clear();
     this.needCache.set(wakeDate, need);
     return need;
   }
 
-  async plan(): Promise<NightPlan> {
+  async plan(): Promise<NightPlan & { wakeTime: string }> {
     const now = this.now();
-    return planNight(now, this.d.settings, await this.needFor(now));
+    const s = await this.settings(now);
+    return { ...planNight(now, s, await this.needFor(now, s)), wakeTime: s.wakeTime };
   }
 
   /** Call every few minutes. Fires whatever is due and hasn't fired yet. */
   async tick(): Promise<TickResult> {
     const now = this.now();
-    const s = this.d.settings;
+    const s = await this.settings(now);
     // Only ask WHOOP for the sleep need when bedtime is getting close.
-    const need = nightIsNear(now, s) ? await this.needFor(now) : { needMs: s.maxNeedMs, source: "default" as const };
+    const need = nightIsNear(now, s) ? await this.needFor(now, s) : { needMs: s.maxNeedMs, source: "default" as const };
     const result: TickResult = { fired: [], errors: [] };
     for (const ev of dueEvents(now, s, need)) {
       if (!(await this.d.store.claim(ev.key))) continue;
@@ -104,24 +137,21 @@ export class SleepCoach {
 
   /**
    * React to a WHOOP webhook. When WHOOP records that you've woken up from your main sleep,
-   * fire the morning wake-up right away (the scheduled one becomes a no-op for that day).
+   * read the morning briefing and run the Morning routine — once per morning.
    */
   async onWhoopEvent(ev: WhoopEvent): Promise<{ fired?: string; skipped?: string }> {
     if (ev.type !== "sleep.updated" && ev.type !== "recovery.updated") return { skipped: `ignored ${ev.type}` };
     const client = await this.d.whoop();
     const sleep = await client.getSleepById(String(ev.id));
-    if (!sleep?.end || sleep.nap) return { skipped: "nap or sleep still in progress" };
-    const start = new Date(sleep.start).getTime();
-    const end = new Date(sleep.end);
+    if (!isMainSleep(sleep)) return { skipped: "nap or sleep still in progress" };
     const now = this.now();
-    if (end.getTime() - start < 3 * HOUR) return { skipped: "too short to be the main sleep" };
-    if (now.getTime() - end.getTime() > HOUR) return { skipped: "sleep ended over an hour ago" };
-    const date = morningWakeDate(end, this.d.settings);
+    if (now.getTime() - new Date(sleep.end).getTime() > HOUR) return { skipped: "sleep ended over an hour ago" };
+    const date = morningWakeDate(sleep, this.d.settings.tz);
     if (!date) return { skipped: "not a morning wake-up" };
     const key = `wake:${date}`;
     if (!(await this.d.store.claim(key))) return { skipped: `${key} already fired` };
     try {
-      await this.run("wake", now);
+      await this.wake(sleep);
       this.log(`fired ${key} from WHOOP ${ev.type}`);
       return { fired: key };
     } catch (e) {
@@ -132,63 +162,71 @@ export class SleepCoach {
 
   /** Run one event right now, ignoring the schedule (used by the /test endpoint). */
   async run(kind: CoachEventKind, now = this.now()): Promise<string> {
-    const s = this.d.settings;
     const dev = this.d.devices;
+    if (kind === "wake") return this.wake();
+
+    const s = await this.settings(now);
+    const plan = planNight(now, s, await this.needFor(now, s));
     const hi = this.d.name ? `${this.d.name}, ` : "";
     const at = (t: Date) => spokenTime(s.tz, t);
+    const wakeLine = this.d.autoWakeTime ? `around ${at(plan.wakeAt)}` : `at ${at(plan.wakeAt)}`;
 
     if (kind === "wind_down") {
-      const plan = planNight(now, s, await this.needFor(now));
       const speech = `${hi}it's ${at(now)}. Time to start winding down. Lights out at ${at(plan.bedtimeAt)}, `
-        + `so you get ${spokenDuration(plan.need.needMs)} of sleep before your ${at(plan.wakeAt)} wake-up.`;
+        + `so you get ${spokenDuration(plan.need.needMs)} of sleep before waking up ${wakeLine}.`;
       await this.d.voice.announce(dev.speaker, speech);
       if (dev.windDownTrigger) await this.d.voice.trigger(dev.windDownTrigger);
       return speech;
     }
 
-    if (kind === "bedtime") {
-      const plan = planNight(now, s, await this.needFor(now));
-      const speech = `${hi}it's ${at(now)}. Time to go to sleep. Phone away, lights off. `
-        + `I'll wake you at ${at(plan.wakeAt)}. Good night!`;
-      await this.d.voice.announce(dev.speaker, speech);
-      if (dev.bedtimeTrigger) await this.d.voice.trigger(dev.bedtimeTrigger);
-      return speech;
-    }
-
-    const speech = `Good morning${this.d.name ? ` ${this.d.name}` : ""}! It's ${at(now)}, time to wake up. `
-      + await this.morningStats(now);
-    await this.d.voice.announce(dev.speaker, speech.trim());
-    if (dev.morningTrigger) await this.d.voice.trigger(dev.morningTrigger);
-    return speech.trim();
+    const speech = this.d.autoWakeTime
+      ? `${hi}it's ${at(now)}. Time to go to sleep. Phone away, lights off. Good night!`
+      : `${hi}it's ${at(now)}. Time to go to sleep. Phone away, lights off. I'll wake you ${wakeLine}. Good night!`;
+    await this.d.voice.announce(dev.speaker, speech);
+    if (dev.bedtimeTrigger) await this.d.voice.trigger(dev.bedtimeTrigger);
+    return speech;
   }
 
-  /** "You slept 7 hours 10 minutes, and your recovery is 72 percent." — or nothing if not scored yet. */
-  private async morningStats(now: Date): Promise<string> {
+  /**
+   * Morning briefing: sleep, recovery, today's workout. Gives WHOOP up to ~3 minutes to finish
+   * scoring recovery first, then speaks and runs the Morning routine.
+   */
+  private async wake(sleepHint?: any): Promise<string> {
+    const s = this.d.settings;
+    let sleep: any;
+    let recovery: any;
     try {
       const client = await this.d.whoop();
-      const since = new Date(now.getTime() - 14 * HOUR).toISOString();
-      const [sleeps, recoveries] = await Promise.all([
-        client.getSleep({ start: since, limit: 5 }),
-        client.getRecovery({ start: since, limit: 1 }),
-      ]);
-      const sleep = sleeps.find((r) => !r.nap && r.score_state === "SCORED");
-      const st = sleep?.score?.stage_summary;
-      const sleptMs = st
-        ? (st.total_light_sleep_time_milli ?? 0) + (st.total_slow_wave_sleep_time_milli ?? 0) + (st.total_rem_sleep_time_milli ?? 0)
-        : 0;
-      const rec = recoveries.find((r) => r.score_state === "SCORED")?.score?.recovery_score;
-      const parts: string[] = [];
-      if (sleptMs > 0) parts.push(`You slept ${spokenDuration(sleptMs)}`);
-      if (typeof rec === "number") parts.push(`your recovery is ${Math.round(rec)} percent`);
-      if (parts.length === 0) return "Your recovery will be ready in WHOOP in a few minutes.";
-      const line = parts.join(", and ") + ".";
-      const tip = typeof rec === "number"
-        ? rec >= 67 ? " Good day to train hard." : rec < 34 ? " Take it easy today." : ""
-        : "";
-      return line.charAt(0).toUpperCase() + line.slice(1) + tip;
+      const since = new Date(this.now().getTime() - 16 * HOUR).toISOString();
+      const pickSleep = async () => {
+        if (sleepHint?.id) return (await client.getSleepById(sleepHint.id)) ?? sleepHint;
+        return (await client.getSleep({ start: since, limit: 5 })).find((r) => isMainSleep(r));
+      };
+      for (let attempt = 0; ; attempt++) {
+        sleep = await pickSleep();
+        const recs = await client.getRecovery({ limit: 3 });
+        recovery = recs.find((r) => sleep && r.sleep_id === sleep.id);
+        const ready = sleep?.score_state === "SCORED" && recovery?.score_state === "SCORED";
+        if (ready || !sleepHint || attempt >= 6) break;
+        await this.wait(30_000);
+      }
     } catch (e) {
-      this.log(`morning stats unavailable: ${(e as Error).message}`);
-      return "";
+      this.log(`morning WHOOP data unavailable: ${(e as Error).message}`);
     }
+
+    let workout = null;
+    if (this.d.hevy && this.d.workoutRotation?.length) {
+      try {
+        const [routines, workouts] = await Promise.all([this.d.hevy.getRoutines(), this.d.hevy.getWorkouts({ maxWorkouts: 10 })]);
+        workout = plannedWorkout(this.d.workoutRotation, routines, workouts, s.tz, this.now());
+      } catch (e) {
+        this.log(`Hevy unavailable: ${(e as Error).message}`);
+      }
+    }
+
+    const speech = buildMorningBriefing({ name: this.d.name, tz: s.tz, now: this.now(), sleep, recovery, workout });
+    await this.d.voice.announce(this.d.devices.speaker, speech);
+    if (this.d.devices.morningTrigger) await this.d.voice.trigger(this.d.devices.morningTrigger);
+    return speech;
   }
 }

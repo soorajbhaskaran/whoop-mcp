@@ -13,11 +13,8 @@ export interface CoachSettings {
   maxNeedMs: number;
   maxCarryoverMs: number;     // at most this much of last night's shortfall is added tonight
   eventWindowMs: number;      // an event still fires if a tick arrives up to this late
-  /**
-   * Minutes after wakeTime that the scheduled wake-up fires. 0 = wake exactly at wakeTime.
-   * When WHOOP drives the wake-up, this is the safety net in case WHOOP never reports you awake.
-   */
-  wakeFallbackMinutes: number;
+  /** Announce good morning at wakeTime. Off when WHOOP drives the wake-up instead. */
+  scheduledWake: boolean;
 }
 
 export const DEFAULT_SETTINGS: Omit<CoachSettings, "tz" | "wakeTime"> = {
@@ -27,7 +24,7 @@ export const DEFAULT_SETTINGS: Omit<CoachSettings, "tz" | "wakeTime"> = {
   maxNeedMs: 10 * HOUR,
   maxCarryoverMs: 90 * MIN,
   eventWindowMs: 90 * MIN,
-  wakeFallbackMinutes: 0,
+  scheduledWake: true,
 };
 
 export type CoachEventKind = "wind_down" | "bedtime" | "wake";
@@ -69,7 +66,7 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
  * This mirrors the idea behind WHOOP's Sleep Planner; the API doesn't expose the planner itself.
  */
 export function estimateSleepNeed(sleeps: any[], s: CoachSettings): SleepNeed {
-  const last = sleeps.find((r) => r && !r.nap && r.score_state === "SCORED" && r.score?.sleep_needed);
+  const last = sleeps.find((r) => isMainSleep(r) && r.score_state === "SCORED" && r.score?.sleep_needed);
   if (!last) return { needMs: s.defaultNeedMs, source: "default" };
   const sn = last.score.sleep_needed;
   const st = last.score.stage_summary ?? {};
@@ -114,8 +111,8 @@ export function dueEvents(now: Date, s: CoachSettings, need: SleepNeed): DueEven
   const out: DueEvent[] = [];
 
   const today = localDate(s.tz, now);
-  const wakeAt = new Date(wakeInstant(today, s).getTime() + s.wakeFallbackMinutes * MIN);
-  if (inWindow(wakeAt, new Date(wakeAt.getTime() + s.eventWindowMs))) {
+  const wakeAt = wakeInstant(today, s);
+  if (s.scheduledWake && inWindow(wakeAt, new Date(wakeAt.getTime() + s.eventWindowMs))) {
     out.push({ kind: "wake", key: `wake:${today}`, at: wakeAt });
   }
 
@@ -130,13 +127,47 @@ export function dueEvents(now: Date, s: CoachSettings, need: SleepNeed): DueEven
 }
 
 /**
- * Is a sleep that ended at `end` your main morning wake-up (not a 3 AM bathroom trip, not a nap)?
- * True when it ended between 2 hours before and 3 hours after that day's wake time.
- * Returns the local date the wake-up belongs to, or null.
+ * A night's main sleep: at least 3 hours long. WHOOP's own `nap` flag isn't trusted — it
+ * sometimes labels a full night as a nap.
  */
-export function morningWakeDate(end: Date, s: CoachSettings): string | null {
-  const date = localDate(s.tz, end);
-  const wake = wakeInstant(date, s).getTime();
-  const t = end.getTime();
-  return t >= wake - 2 * HOUR && t <= wake + 3 * HOUR ? date : null;
+export function isMainSleep(r: any): boolean {
+  if (!r?.start || !r?.end) return false;
+  return new Date(r.end).getTime() - new Date(r.start).getTime() >= 3 * HOUR;
+}
+
+const MORNING_FROM = 4 * 60 + 30; // 04:30
+const MORNING_TO = 14 * 60;       // 14:00
+
+function localMinutes(tz: string, at: Date): number {
+  const [h, m] = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+    .format(at).split(":").map(Number);
+  return h * 60 + m;
+}
+
+/**
+ * If this sleep is the main sleep of a night that ended in the morning (04:30–14:00 local),
+ * the local date of that morning; otherwise null (naps, 3 AM wake-ups, afternoon sleeps).
+ */
+export function morningWakeDate(sleep: any, tz: string): string | null {
+  if (!isMainSleep(sleep)) return null;
+  const end = new Date(sleep.end);
+  const min = localMinutes(tz, end);
+  return min >= MORNING_FROM && min <= MORNING_TO ? localDate(tz, end) : null;
+}
+
+/**
+ * Your usual wake-up time ("HH:MM", rounded to 15 min): the median end of your morning main
+ * sleeps over the last two weeks. Null if there are fewer than 3 such nights.
+ */
+export function typicalWakeTime(sleeps: any[], tz: string, now: Date): string | null {
+  const since = now.getTime() - 14 * 24 * HOUR;
+  const mins = sleeps
+    .filter((r) => morningWakeDate(r, tz) && new Date(r.end).getTime() >= since)
+    .map((r) => localMinutes(tz, new Date(r.end)))
+    .sort((a, b) => a - b);
+  if (mins.length < 3) return null;
+  const mid = mins.length / 2;
+  const median = mins.length % 2 ? mins[Math.floor(mid)] : (mins[mid - 1] + mins[mid]) / 2;
+  const rounded = Math.round(median / 15) * 15;
+  return `${String(Math.floor(rounded / 60)).padStart(2, "0")}:${String(rounded % 60).padStart(2, "0")}`;
 }
