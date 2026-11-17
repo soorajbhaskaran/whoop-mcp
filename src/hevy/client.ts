@@ -146,6 +146,7 @@ export function summarizeWorkout(w: any) {
   return {
     id: w.id,
     title: w.title,
+    description: w.description || undefined,
     start_time: w.start_time,
     end_time: w.end_time,
     duration_min: w.start_time && w.end_time
